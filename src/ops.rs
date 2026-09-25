@@ -127,8 +127,163 @@ pub fn matmul_tiled(a: &Tensor, b: &Tensor) -> Result<Tensor, TensorError> {
     Tensor::from_vec(out, &[m, n])
 }
 
-/// Explicit NEON micro-kernel, compiled only for AArch64 targets.
+/// Panel widths for the packed GEMM. `MC x KC` of `A` and `KC x NC` of `B` are
+/// packed into contiguous buffers so the innermost loop always walks memory in
+/// order; the sizes are chosen so a packed panel pair sits inside L1/L2.
+const GEMM_MC: usize = 128;
+const GEMM_KC: usize = 768;
+const GEMM_NC: usize = 768;
+
+/// Cache-blocked, packed GEMM: `[m, k] x [k, n] -> [m, n]`.
 ///
+/// [`matmul_tiled`] tiles the output but reads both operands straight from the
+/// originals. That works while a row fits in cache and collapses when it does
+/// not: at `n = 49152` each `rhs` row is 192 KB, so the `k` loop strides far
+/// outside L2 every step and throughput fell from 65 to 17 GFLOP/s in the
+/// benchmark. Prefill produces exactly those tall shapes.
+///
+/// This version fixes it the way BLAS does — pack and block:
+///
+/// 1. `A` is copied into `MC x KC` panels, `B` into `KC x NC` panels. Packing
+///    makes each panel contiguous, so every inner-loop access is sequential and
+///    a cache line fetched is a cache line used.
+/// 2. The panels are walked so the `MR x NR` micro-kernel sees a `k` range of
+///    at most `KC` and a `B` panel of at most `KC x NR` — a few kilobytes.
+///
+/// The result is identical to [`matmul_tiled`] up to floating-point summation
+/// order, because both accumulate over `k` in a different grouping.
+pub fn matmul_packed(a: &Tensor, b: &Tensor) -> Result<Tensor, TensorError> {
+    let (m, k, n) = matmul_dims(a, b)?;
+    let lhs = a.data();
+    let rhs = b.data();
+    let mut out = vec![0.0f32; m * n];
+
+    // Edge columns and rows keep the scalar path; prefill shapes are usually
+    // multiples of the tile sizes, and correctness does not depend on it.
+    let i_full = m - m % MR;
+    let j_full = n - n % NR;
+
+    if i_full == 0 || j_full == 0 {
+        scalar_kernel(lhs, rhs, &mut out, m, n, k, 0);
+        return Tensor::from_vec(out, &[m, n]);
+    }
+
+    let mut a_panel = vec![0.0f32; GEMM_MC * GEMM_KC];
+    let mut b_panel = vec![0.0f32; GEMM_KC * GEMM_NC];
+
+    for i0 in (0..i_full).step_by(GEMM_MC) {
+        let mc = GEMM_MC.min(i_full - i0);
+        for j0 in (0..j_full).step_by(GEMM_NC) {
+            let nc = GEMM_NC.min(j_full - j0);
+            for p0 in (0..k).step_by(GEMM_KC) {
+                let kc = GEMM_KC.min(k - p0);
+                // Pack `A[i0..i0+mc, p0..p0+kc]` row-major.
+                for i in 0..mc {
+                    let src = &lhs[(i0 + i) * k + p0..(i0 + i) * k + p0 + kc];
+                    a_panel[i * kc..i * kc + kc].copy_from_slice(src);
+                }
+                // Pack `B[p0..p0+kc, j0..j0+nc]` row-major; its rows are the
+                // strides that used to blow the cache, and here they become
+                // contiguous.
+                for p in 0..kc {
+                    let src = &rhs[(p0 + p) * n + j0..(p0 + p) * n + j0 + nc];
+                    b_panel[p * nc..p * nc + nc].copy_from_slice(src);
+                }
+                packed_micro(&a_panel, &b_panel, &mut out, n, mc, nc, kc, i0, j0, p0);
+            }
+        }
+    }
+
+    if j_full < n {
+        scalar_kernel(lhs, rhs, &mut out, i_full, n, k, j_full);
+    }
+    if i_full < m {
+        scalar_kernel(
+            &lhs[i_full * k..],
+            rhs,
+            &mut out[i_full * n..],
+            m - i_full,
+            n,
+            k,
+            0,
+        );
+    }
+    Tensor::from_vec(out, &[m, n])
+}
+
+/// Run the `MR x NR` micro-kernel over one packed panel pair.
+///
+/// `a_panel` is `mc x kc` packed row-major and `b_panel` is `kc x nc` packed
+/// row-major, so the `k` loop inside a tile reads two short contiguous runs
+/// instead of striding across the full matrices.
+#[allow(clippy::too_many_arguments)]
+fn packed_micro(
+    a_panel: &[f32],
+    b_panel: &[f32],
+    out: &mut [f32],
+    n: usize,
+    mc: usize,
+    nc: usize,
+    kc: usize,
+    i0: usize,
+    j0: usize,
+    _p0: usize,
+) {
+    let i_tiles = mc - mc % MR;
+    let j_tiles = nc - nc % NR;
+    for ii in (0..i_tiles).step_by(MR) {
+        let a_rows: [&[f32]; MR] =
+            std::array::from_fn(|r| &a_panel[(ii + r) * kc..(ii + r) * kc + kc]);
+        for jj in (0..j_tiles).step_by(NR) {
+            let mut acc = [[0.0f32; NR]; MR];
+            for p in 0..kc {
+                let b_row = &b_panel[p * nc + jj..p * nc + jj + NR];
+                for (r, acc_row) in acc.iter_mut().enumerate() {
+                    let a_rp = a_rows[r][p];
+                    for (q, acc) in acc_row.iter_mut().enumerate() {
+                        *acc = a_rp.mul_add(b_row[q], *acc);
+                    }
+                }
+            }
+            for (r, acc_row) in acc.iter().enumerate() {
+                let c = &mut out[(i0 + ii + r) * n + j0 + jj..(i0 + ii + r) * n + j0 + jj + NR];
+                for (q, acc) in acc_row.iter().enumerate() {
+                    c[q] += acc;
+                }
+            }
+        }
+        // Column remainder within the panel.
+        if j_tiles < nc {
+            for (r, a_row) in a_rows.iter().enumerate() {
+                let c_base = (i0 + ii + r) * n + j0;
+                for q in j_tiles..nc {
+                    let mut acc = 0.0f32;
+                    for p in 0..kc {
+                        acc = a_row[p].mul_add(b_panel[p * nc + q], acc);
+                    }
+                    out[c_base + q] += acc;
+                }
+            }
+        }
+    }
+    // Row remainder within the panel, via the scalar kernel on the packed data.
+    if i_tiles < mc {
+        for i in i_tiles..mc {
+            let a_row = &a_panel[i * kc..i * kc + kc];
+            let c = &mut out[(i0 + i) * n + j0..(i0 + i) * n + j0 + nc];
+            c.fill(0.0);
+            for p in 0..kc {
+                let ap = a_row[p];
+                let brow = &b_panel[p * nc..p * nc + nc];
+                for (q, cv) in c.iter_mut().enumerate() {
+                    *cv += ap * brow[q];
+                }
+            }
+        }
+    }
+}
+
+/// Explicit NEON micro-kernel, compiled only for AArch64 targets.///
 /// Identical algorithm to [`micro_kernel`] — same `MR x NR` tile, same hoisted
 /// row slices, same fused multiply-add — but the arithmetic is written directly
 /// as NEON intrinsics instead of asking LLVM's auto-vectorizer to reconstruct it
@@ -1213,6 +1368,36 @@ mod tests {
             let reference = matmul(&a, &b).unwrap();
             let tiled = matmul_tiled(&a, &b).unwrap();
             assert_close(&tiled, &reference, &format!("{m}x{k}x{n}"));
+        }
+    }
+
+    /// The packed GEMM must agree with the reference on the same shape grid,
+    /// including the panel remainders (odd `m`, `k` and `n` all land in the
+    /// pack-tail paths).
+    #[test]
+    fn matmul_packed_matches_reference() {
+        let shapes = [
+            (1, 1, 1),
+            (3, 5, 7),
+            (7, 9, 5),
+            (8, 4, 8),
+            (8, 8, 8),
+            (16, 16, 16),
+            (17, 19, 23),
+            (33, 17, 9),
+            (64, 64, 64),
+            (65, 257, 513),
+            (128, 576, 1536),
+            (0, 4, 0),
+            (5, 0, 6),
+            (0, 0, 0),
+        ];
+        for (m, k, n) in shapes {
+            let a = random(&[m, k], 11);
+            let b = random(&[k, n], 12);
+            let reference = matmul(&a, &b).unwrap();
+            let packed = matmul_packed(&a, &b).unwrap();
+            assert_close(&packed, &reference, &format!("{m}x{k}x{n}"));
         }
     }
 

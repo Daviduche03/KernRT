@@ -211,9 +211,168 @@ pub fn matmul_packed(a: &Tensor, b: &Tensor) -> Result<Tensor, TensorError> {
     Tensor::from_vec(out, &[m, n])
 }
 
-/// Run the `MR x NR` micro-kernel over one packed panel pair.
+/// Packed GEMM against a transposed right operand: `A[m, k] * W[n, k]^T`, giving
+/// `[m, n]`.
 ///
-/// `a_panel` is `mc x kc` packed row-major and `b_panel` is `kc x nc` packed
+/// This is the form a linear layer actually has: weights everywhere (llama2.c,
+/// safetensors, GGUF) are stored `[out, in]`, so a batch of `m` activations
+/// needs `X * W^T`. Materializing `W^T` would cost a full copy of the weights
+/// (hundreds of megabytes), and it is not needed: only the packing step cares
+/// about the operand layout, and it can gather a column of `W` instead of a row.
+/// The transposed gather is exactly as cache-friendly once packed, because the
+/// pack loop reads one `W` row per output column and writes it contiguously.
+///
+/// The result matches `matmul_packed(a, transpose(w))` up to summation order.
+pub fn matmul_packed_nt(a: &Tensor, w: &Tensor) -> Result<Tensor, TensorError> {
+    let ash = a.shape();
+    let wsh = w.shape();
+    if ash.len() != 2 || wsh.len() != 2 || ash[1] != wsh[1] {
+        return Err(TensorError::ShapeMismatch {
+            op: "matmul_packed_nt",
+            a: ash.to_vec(),
+            b: wsh.to_vec(),
+        });
+    }
+    let (m, k) = (ash[0], ash[1]);
+    let n = wsh[0];
+    let lhs = a.data();
+    let weights = w.data();
+    let mut out = vec![0.0f32; m * n];
+
+    let i_full = m - m % MR;
+    let j_full = n - n % NR;
+
+    if i_full == 0 || j_full == 0 {
+        // Scalar fallback against the transposed view, built row by row.
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    acc = lhs[i * k + p].mul_add(weights[j * k + p], acc);
+                }
+                out[i * n + j] = acc;
+            }
+        }
+        return Tensor::from_vec(out, &[m, n]);
+    }
+
+    let mut a_panel = vec![0.0f32; GEMM_MC * GEMM_KC];
+    let mut b_panel = vec![0.0f32; GEMM_KC * GEMM_NC];
+
+    for i0 in (0..i_full).step_by(GEMM_MC) {
+        let mc = GEMM_MC.min(i_full - i0);
+        for j0 in (0..j_full).step_by(GEMM_NC) {
+            let nc = GEMM_NC.min(j_full - j0);
+            for p0 in (0..k).step_by(GEMM_KC) {
+                let kc = GEMM_KC.min(k - p0);
+                for i in 0..mc {
+                    let src = &lhs[(i0 + i) * k + p0..(i0 + i) * k + p0 + kc];
+                    a_panel[i * kc..i * kc + kc].copy_from_slice(src);
+                }
+                // Each of the `nc` output columns is one row of `W`, so the pack
+                // gathers `W[j0 + j, p0..p0+kc]` — contiguous reads of the
+                // weight matrix, written transposed into the panel.
+                for j in 0..nc {
+                    let src = &weights[(j0 + j) * k + p0..(j0 + j) * k + p0 + kc];
+                    b_panel[j * kc..j * kc + kc].copy_from_slice(src);
+                }
+                // `packed_micro` expects a `kc x nc` panel, so the gather above
+                // is written column-major into it.
+                packed_micro_transposed(&a_panel, &b_panel, &mut out, n, mc, nc, kc, i0, j0);
+            }
+        }
+    }
+
+    if j_full < n || i_full < m {
+        for i in i_full..m {
+            for j in 0..n {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    acc = lhs[i * k + p].mul_add(weights[j * k + p], acc);
+                }
+                out[i * n + j] = acc;
+            }
+        }
+        for i in 0..i_full {
+            for j in j_full..n {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    acc = lhs[i * k + p].mul_add(weights[j * k + p], acc);
+                }
+                out[i * n + j] = acc;
+            }
+        }
+    }
+    Tensor::from_vec(out, &[m, n])
+}
+
+/// Micro-kernel over a panel pair where the `B` panel is stored so that panel
+/// column `j` is contiguous in `k` (i.e. transposed relative to [`packed_micro`]).
+#[allow(clippy::too_many_arguments)]
+fn packed_micro_transposed(
+    a_panel: &[f32],
+    b_panel: &[f32],
+    out: &mut [f32],
+    n: usize,
+    mc: usize,
+    nc: usize,
+    kc: usize,
+    i0: usize,
+    j0: usize,
+) {
+    let i_tiles = mc - mc % MR;
+    let j_tiles = nc - nc % NR;
+    for ii in (0..i_tiles).step_by(MR) {
+        let a_rows: [&[f32]; MR] =
+            std::array::from_fn(|r| &a_panel[(ii + r) * kc..(ii + r) * kc + kc]);
+        for jj in (0..j_tiles).step_by(NR) {
+            // `acc[i][j]` accumulates output row `i`, column `j`. The `B` panel
+            // is stored column-major in `k`, so panel column `jj + j` holds
+            // `W[jj + j, p0..p0+kc]` contiguously.
+            let mut acc = [[0.0f32; NR]; MR];
+            for p in 0..kc {
+                for (i, row) in acc.iter_mut().enumerate() {
+                    let a_ip = a_rows[i][p];
+                    for (j, cell) in row.iter_mut().enumerate() {
+                        *cell = a_ip.mul_add(b_panel[(jj + j) * kc + p], *cell);
+                    }
+                }
+            }
+            for (i, row) in acc.iter().enumerate() {
+                let c = &mut out[(i0 + ii + i) * n + j0 + jj..(i0 + ii + i) * n + j0 + jj + NR];
+                for (j, cell) in row.iter().enumerate() {
+                    c[j] += cell;
+                }
+            }
+        }
+    }
+    // Remainders, straight scalar over the packed panels.
+    for ii in i_tiles..mc {
+        let a_row = &a_panel[ii * kc..ii * kc + kc];
+        for jj in 0..nc {
+            let mut acc = 0.0f32;
+            let b_col = &b_panel[jj * kc..jj * kc + kc];
+            for p in 0..kc {
+                acc = a_row[p].mul_add(b_col[p], acc);
+            }
+            out[(i0 + ii) * n + j0 + jj] += acc;
+        }
+    }
+    for ii in 0..i_tiles {
+        let a_row = &a_panel[ii * kc..ii * kc + kc];
+        for jj in j_tiles..nc {
+            let mut acc = 0.0f32;
+            let b_col = &b_panel[jj * kc..jj * kc + kc];
+            for p in 0..kc {
+                acc = a_row[p].mul_add(b_col[p], acc);
+            }
+            out[(i0 + ii) * n + j0 + jj] += acc;
+        }
+    }
+}
+
+/// Run the `MR x NR` micro-kernel over one packed panel pair.
+////// `a_panel` is `mc x kc` packed row-major and `b_panel` is `kc x nc` packed
 /// row-major, so the `k` loop inside a tile reads two short contiguous runs
 /// instead of striding across the full matrices.
 #[allow(clippy::too_many_arguments)]
@@ -722,6 +881,27 @@ impl Matrix {
             Matrix::F32(t) => t.shape()[1],
             Matrix::Bf16 { in_dim, .. } | Matrix::Q8_0 { in_dim, .. } => *in_dim,
         }
+    }
+
+    /// The whole matrix widened to f32, row-major `[out, in]`.
+    ///
+    /// Only for the batched path, where there is no low-precision GEMM yet: it
+    /// costs a full copy of the weights, so it should be called once per model,
+    /// not once per layer per token.
+    pub fn to_f32_tensor(&self) -> Tensor {
+        let (out_dim, in_dim) = (self.out_dim(), self.in_dim());
+        let data = match self {
+            Matrix::F32(t) => t.data().to_vec(),
+            Matrix::Bf16 { data, .. } => data.iter().map(|&b| bf16_to_f32(b)).collect(),
+            Matrix::Q8_0 { .. } => {
+                let mut all = Vec::with_capacity(out_dim * in_dim);
+                for r in 0..out_dim {
+                    all.extend(self.row(r));
+                }
+                all
+            }
+        };
+        Tensor::from_vec(data, &[out_dim, in_dim]).expect("shape matches the data")
     }
 
     /// Read row `index` as f32 — used for the token-embedding lookup.
@@ -1368,6 +1548,29 @@ mod tests {
             let reference = matmul(&a, &b).unwrap();
             let tiled = matmul_tiled(&a, &b).unwrap();
             assert_close(&tiled, &reference, &format!("{m}x{k}x{n}"));
+        }
+    }
+
+    /// `matmul_packed_nt(a, w)` is `a * w^T`, checked against the plain
+    /// reference with an explicit transpose.
+    #[test]
+    fn matmul_packed_nt_matches_reference() {
+        for (m, k, n) in [
+            (1usize, 1usize, 1usize),
+            (3, 5, 7),
+            (8, 8, 8),
+            (17, 19, 23),
+            (33, 17, 9),
+            (64, 64, 64),
+            (65, 257, 513),
+            (128, 576, 1536),
+        ] {
+            let a = random(&[m, k], 21);
+            let w = random(&[n, k], 22);
+            let reference = matmul(&a, &transpose(&w).unwrap()).unwrap();
+            let got = matmul_packed_nt(&a, &w).unwrap();
+            assert_eq!(got.shape(), reference.shape());
+            assert_close(&got, &reference, &format!("{m}x{k}x{n}"));
         }
     }
 

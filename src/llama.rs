@@ -9,7 +9,7 @@
 
 use crate::llama2c::{Checkpoint, LayerWeights, Llama2cError};
 use crate::ops::{Matrix, Q8_0_BLOCK, Q8Vec, dot, gemv_into, gemv_q8_0_into, softmax_in_place};
-use crate::safetensors::{self, SafeTensorsError};
+use crate::safetensors::{self, RawTensor, SafeTensorsError};
 use crate::tensor::Tensor;
 use std::collections::HashMap;
 use std::fmt;
@@ -59,6 +59,8 @@ pub enum LoadError {
     SafeTensors(SafeTensorsError),
     MissingTensor(String),
     BadConfig(String),
+    /// A tensor's shape or element count was inconsistent.
+    Tensor(crate::tensor::TensorError),
 }
 
 impl fmt::Display for LoadError {
@@ -69,6 +71,7 @@ impl fmt::Display for LoadError {
             LoadError::SafeTensors(e) => write!(f, "{e}"),
             LoadError::MissingTensor(name) => write!(f, "weight file is missing {name:?}"),
             LoadError::BadConfig(msg) => write!(f, "invalid config: {msg}"),
+            LoadError::Tensor(e) => write!(f, "{e}"),
         }
     }
 }
@@ -99,6 +102,12 @@ impl From<serde_json::Error> for LoadError {
 impl From<SafeTensorsError> for LoadError {
     fn from(e: SafeTensorsError) -> Self {
         LoadError::SafeTensors(e)
+    }
+}
+
+impl From<crate::tensor::TensorError> for LoadError {
+    fn from(e: crate::tensor::TensorError) -> Self {
+        LoadError::Tensor(e)
     }
 }
 
@@ -186,47 +195,49 @@ impl Llama {
         } else {
             Storage::F32
         };
-        let mut tensors = safetensors::load(dir.join("model.safetensors"))?;
+        // The raw reader keeps bf16 weights in their stored form, so a bf16
+        // model never round-trips through `f32`.
+        let mut tensors = safetensors::load_raw(dir.join("model.safetensors"))?;
 
-        let token_embedding = take_matrix(&mut tensors, "model.embed_tokens.weight", storage)?;
-        let rms_final = take(&mut tensors, "model.norm.weight")?;
+        let token_embedding = take_matrix_raw(&mut tensors, "model.embed_tokens.weight", storage)?;
+        let rms_final = take_f32(&mut tensors, "model.norm.weight")?;
         let mut layers = Vec::with_capacity(config.n_layers);
         for l in 0..config.n_layers {
             let p = format!("model.layers.{l}");
             layers.push(LayerWeights {
-                rms_att: take(&mut tensors, &format!("{p}.input_layernorm.weight"))?,
-                wq: take_matrix(
+                rms_att: take_f32(&mut tensors, &format!("{p}.input_layernorm.weight"))?,
+                wq: take_matrix_raw(
                     &mut tensors,
                     &format!("{p}.self_attn.q_proj.weight"),
                     storage,
                 )?,
-                wk: take_matrix(
+                wk: take_matrix_raw(
                     &mut tensors,
                     &format!("{p}.self_attn.k_proj.weight"),
                     storage,
                 )?,
-                wv: take_matrix(
+                wv: take_matrix_raw(
                     &mut tensors,
                     &format!("{p}.self_attn.v_proj.weight"),
                     storage,
                 )?,
-                wo: take_matrix(
+                wo: take_matrix_raw(
                     &mut tensors,
                     &format!("{p}.self_attn.o_proj.weight"),
                     storage,
                 )?,
-                rms_ffn: take(
+                rms_ffn: take_f32(
                     &mut tensors,
                     &format!("{p}.post_attention_layernorm.weight"),
                 )?,
-                w1: take_matrix(&mut tensors, &format!("{p}.mlp.gate_proj.weight"), storage)?,
-                w2: take_matrix(&mut tensors, &format!("{p}.mlp.down_proj.weight"), storage)?,
-                w3: take_matrix(&mut tensors, &format!("{p}.mlp.up_proj.weight"), storage)?,
+                w1: take_matrix_raw(&mut tensors, &format!("{p}.mlp.gate_proj.weight"), storage)?,
+                w2: take_matrix_raw(&mut tensors, &format!("{p}.mlp.down_proj.weight"), storage)?,
+                w3: take_matrix_raw(&mut tensors, &format!("{p}.mlp.up_proj.weight"), storage)?,
             });
         }
         // Tied models store no lm_head.
-        let wcls = match tensors.remove("lm_head.weight") {
-            Some(tensor) => Some(matrix_from(tensor, storage)?),
+        let wcls = match take_optional_raw(&mut tensors, "lm_head.weight")? {
+            Some(raw) => Some(matrix_from_raw(raw, storage)?),
             None => None,
         };
         Ok(Self::new(config, token_embedding, layers, rms_final, wcls))
@@ -421,48 +432,93 @@ enum Storage {
     Q8_0,
 }
 
-/// Take a tensor by name out of a weight map and store it at the given width.
-fn take_matrix(
-    tensors: &mut HashMap<String, Tensor>,
+/// Take a raw tensor by name and widen it to f32. Used for the small tensors
+/// (norms) that every path consumes as `f32`.
+fn take_f32(tensors: &mut HashMap<String, RawTensor>, name: &str) -> Result<Tensor, LoadError> {
+    Ok(match take_raw(tensors, name)? {
+        RawTensor::F32(t) | RawTensor::F16(t) => t,
+        RawTensor::Bf16 { bits, shape } => Tensor::from_vec(
+            bits.iter()
+                .map(|&b| f32::from_bits(u32::from(b) << 16))
+                .collect(),
+            &shape,
+        )?,
+    })
+}
+
+/// Take an optional raw tensor by name, for values a tied model omits.
+fn take_optional_raw(
+    tensors: &mut HashMap<String, RawTensor>,
+    name: &str,
+) -> Result<Option<RawTensor>, LoadError> {
+    Ok(tensors.remove(name))
+}
+
+/// Take a raw tensor by name without widening it.
+fn take_raw(tensors: &mut HashMap<String, RawTensor>, name: &str) -> Result<RawTensor, LoadError> {
+    tensors
+        .remove(name)
+        .ok_or_else(|| LoadError::MissingTensor(name.to_string()))
+}
+
+/// Take a weight matrix, honouring its stored form so a bf16 file never passes
+/// through `f32`.
+fn take_matrix_raw(
+    tensors: &mut HashMap<String, RawTensor>,
     name: &str,
     storage: Storage,
 ) -> Result<Matrix, LoadError> {
-    matrix_from(take(tensors, name)?, storage)
+    matrix_from_raw(take_raw(tensors, name)?, storage)
 }
 
-/// Wrap a weight tensor in the requested storage.
-fn matrix_from(tensor: Tensor, storage: Storage) -> Result<Matrix, LoadError> {
-    if tensor.rank() != 2 {
+/// Wrap a raw tensor in the requested storage, widening only when the storage
+/// is wider than what the file holds.
+fn matrix_from_raw(t: RawTensor, storage: Storage) -> Result<Matrix, LoadError> {
+    let shape = t.shape().to_vec();
+    if shape.len() != 2 {
         return Err(LoadError::BadConfig(
             "a weight matrix was not rank 2".into(),
         ));
     }
-    Ok(match storage {
-        Storage::F32 => Matrix::from_f32(tensor),
-        // Q8_0 blocks must not straddle rows; fall back to bf16 for odd shapes.
-        Storage::Q8_0 if tensor.shape()[1] % Q8_0_BLOCK == 0 => {
-            Matrix::from_f32_q8_0(tensor).expect("row length is block-aligned")
+    match (t, storage) {
+        // The file is already bf16 and the model wants bf16: hand over the bits
+        // directly. This is the case the widening loader made expensive.
+        (RawTensor::Bf16 { bits, .. }, Storage::Bf16) => {
+            Ok(Matrix::from_bf16_bits(bits, shape[0], shape[1]))
         }
-        Storage::Q8_0 | Storage::Bf16 => narrow_to_bf16(tensor),
-    })
-}
-
-/// Narrow an f32 tensor to bf16. The safetensors reader widened bf16 by
-/// shifting left 16, so shifting back recovers the exact original bits.
-fn narrow_to_bf16(tensor: Tensor) -> Matrix {
-    let bits: Vec<u16> = tensor
-        .data()
-        .iter()
-        .map(|v| (v.to_bits() >> 16) as u16)
-        .collect();
-    Matrix::from_bf16_bits(bits, tensor.shape()[0], tensor.shape()[1])
-}
-
-/// Take a tensor by name out of a weight map.
-fn take(tensors: &mut HashMap<String, Tensor>, name: &str) -> Result<Tensor, LoadError> {
-    tensors
-        .remove(name)
-        .ok_or_else(|| LoadError::MissingTensor(name.to_string()))
+        (RawTensor::Bf16 { bits, .. }, Storage::Q8_0) if shape[1] % Q8_0_BLOCK == 0 => {
+            let wide: Vec<f32> = bits
+                .iter()
+                .map(|&b| f32::from_bits(u32::from(b) << 16))
+                .collect();
+            let tensor = Tensor::from_vec(wide, &shape)?;
+            Ok(Matrix::from_f32_q8_0(tensor).expect("row length is block-aligned"))
+        }
+        (raw, storage) => {
+            let tensor = match raw {
+                RawTensor::F32(t) | RawTensor::F16(t) => t,
+                RawTensor::Bf16 { bits, .. } => Tensor::from_vec(
+                    bits.iter()
+                        .map(|&b| f32::from_bits(u32::from(b) << 16))
+                        .collect(),
+                    &shape,
+                )?,
+            };
+            match storage {
+                Storage::F32 => Ok(Matrix::from_f32(tensor)),
+                // A bf16 model asking for Q8_0 on a non-block-aligned row:
+                // narrowing keeps the bytes down rather than widening to f32.
+                Storage::Q8_0 | Storage::Bf16 => {
+                    let bits: Vec<u16> = tensor
+                        .data()
+                        .iter()
+                        .map(|v| (v.to_bits() >> 16) as u16)
+                        .collect();
+                    Ok(Matrix::from_bf16_bits(bits, shape[0], shape[1]))
+                }
+            }
+        }
+    }
 }
 
 /// Parse a HuggingFace `config.json` into a [`Config`], plus whether the stored

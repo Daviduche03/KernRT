@@ -20,9 +20,10 @@
 //! it is used to slice or allocate.
 
 use crate::tensor::{Tensor, TensorError};
+use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fmt;
-use std::fs;
+use std::fs::{self, File};
 use std::path::Path;
 
 /// Everything that can go wrong reading a safetensors file.
@@ -98,11 +99,44 @@ impl From<TensorError> for SafeTensorsError {
     }
 }
 
+/// Read every tensor from a safetensors file by mapping it.
+///
+/// The file is mapped read-only rather than read into a `Vec<u8>`. For a model
+/// file this is 257 MB of allocation and copying that the mapping avoids: the
+/// pages are faulted in on demand as the parser walks the header and the tensor
+/// payloads, and the ones already resident are shared with the page cache rather
+/// than duplicated. Tensors are still copied out into owned [`Tensor`]s, so the
+/// mapping is dropped at the end of the call.
+///
+/// Falls back to reading the file when mapping fails, which happens on some
+/// filesystems and on empty files.
+pub fn load(path: impl AsRef<Path>) -> Result<HashMap<String, Tensor>, SafeTensorsError> {
+    let path = path.as_ref();
+    match unsafe { Mmap::map(&File::open(path)?) } {
+        Ok(map) => read_from(&map),
+        Err(_) => {
+            let bytes = fs::read(path)?;
+            read_from(&bytes)
+        }
+    }
+}
+
+/// Map a safetensors file and parse it without widening.
+pub fn load_raw(path: impl AsRef<Path>) -> Result<HashMap<String, RawTensor>, SafeTensorsError> {
+    let path = path.as_ref();
+    match unsafe { Mmap::map(&File::open(path)?) } {
+        Ok(map) => read_raw_from(&map),
+        Err(_) => read_raw_from(&fs::read(path)?),
+    }
+}
+
 /// Read every `F32` tensor from a safetensors file.
 ///
 /// The whole file is read into memory; tensors are copied out of it as owned
 /// [`Tensor`]s.
-pub fn load(path: impl AsRef<Path>) -> Result<HashMap<String, Tensor>, SafeTensorsError> {
+pub fn load_into_memory(
+    path: impl AsRef<Path>,
+) -> Result<HashMap<String, Tensor>, SafeTensorsError> {
     let bytes = fs::read(path)?;
     read_from(&bytes)
 }
@@ -110,6 +144,40 @@ pub fn load(path: impl AsRef<Path>) -> Result<HashMap<String, Tensor>, SafeTenso
 /// Parse from a complete byte image. Split out from [`load`] so tests can build
 /// malformed inputs in memory.
 fn read_from(bytes: &[u8]) -> Result<HashMap<String, Tensor>, SafeTensorsError> {
+    Ok(read_with(bytes, |dtype, raw, shape| {
+        Ok(RawTensor::F32(Tensor::from_vec(dtype.decode(raw), &shape)?))
+    })?
+    .into_iter()
+    .map(|(name, raw)| {
+        // The widening reader never produces the compact variants.
+        let tensor = match raw {
+            RawTensor::F32(t) => t,
+            RawTensor::Bf16 { bits, shape } => Tensor::from_vec(
+                bits.iter()
+                    .map(|&b| f32::from_bits(u32::from(b) << 16))
+                    .collect(),
+                &shape,
+            )
+            .expect("shape came from the file and was validated"),
+            RawTensor::F16(t) => t,
+        };
+        (name, tensor)
+    })
+    .collect())
+}
+
+/// Parse raw tensors from a complete byte image, preserving bf16 bit patterns.
+pub fn read_raw_from(bytes: &[u8]) -> Result<HashMap<String, RawTensor>, SafeTensorsError> {
+    read_with(bytes, |dtype, raw, shape| dtype.decode_raw(raw, shape))
+}
+
+/// Shared parser. `decode` turns one tensor's byte range into a value; every
+/// offset, dtype and shape is validated here before `decode` is called, so both
+/// the widening and the raw reader are held to the same untrusted-input checks.
+fn read_with(
+    bytes: &[u8],
+    decode: impl Fn(DType, &[u8], Vec<usize>) -> Result<RawTensor, SafeTensorsError>,
+) -> Result<HashMap<String, RawTensor>, SafeTensorsError> {
     if bytes.len() < 8 {
         return Err(SafeTensorsError::HeaderTooShort {
             file_len: bytes.len(),
@@ -195,7 +263,7 @@ fn read_from(bytes: &[u8]) -> Result<HashMap<String, Tensor>, SafeTensorsError> 
         }
 
         let raw = &data[start as usize..end as usize];
-        tensors.insert(name.clone(), Tensor::from_vec(dtype.decode(raw), &shape)?);
+        tensors.insert(name.clone(), decode(dtype, raw, shape)?);
     }
     Ok(tensors)
 }
@@ -245,6 +313,54 @@ impl DType {
                 .map(|c| f16_to_f32_local(u16::from_le_bytes([c[0], c[1]])))
                 .collect(),
         }
+    }
+}
+
+/// A tensor exactly as the file stores it, before any widening.
+///
+/// The widening loader turns every element into `f32`, which for a bf16 file
+/// means allocating twice the payload, converting element by element, and then
+/// having the model narrow it straight back to bf16. Carrying the raw bits lets
+/// a bf16 model skip all of that: the payload is a `memcpy` into the shape the
+/// kernels already want.
+pub enum RawTensor {
+    /// Little-endian `f32`, already in the form the kernels compute in.
+    F32(Tensor),
+    /// bf16 bit patterns as little-endian `u16`, `[rows, cols]` order.
+    Bf16 { bits: Vec<u16>, shape: Vec<usize> },
+    /// f16 bit patterns; nothing consumes these raw yet, so they widen.
+    F16(Tensor),
+}
+
+impl RawTensor {
+    /// Shape as stored, regardless of how the payload is held.
+    pub fn shape(&self) -> &[usize] {
+        match self {
+            RawTensor::F32(t) | RawTensor::F16(t) => t.shape(),
+            RawTensor::Bf16 { shape, .. } => shape,
+        }
+    }
+}
+
+impl DType {
+    /// Decode to the compact form where the format has one, else widen.
+    fn decode_raw(self, raw: &[u8], shape: Vec<usize>) -> Result<RawTensor, SafeTensorsError> {
+        Ok(match self {
+            DType::F32 => RawTensor::F32(Tensor::from_vec(
+                raw.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+                &shape,
+            )?),
+            DType::Bf16 => RawTensor::Bf16 {
+                bits: raw
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect(),
+                shape,
+            },
+            DType::F16 => RawTensor::F16(Tensor::from_vec(self.decode(raw), &shape)?),
+        })
     }
 }
 

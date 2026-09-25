@@ -1,0 +1,5 @@
+/target
+
+# Machine-specific toolchain workaround: hardcodes an Xcode SDK path.
+# See the comment inside for why it exists and when to delete it.
+/.cargo/config.toml

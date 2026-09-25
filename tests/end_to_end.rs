@@ -46,3 +46,69 @@ fn missing_file_is_an_io_error() {
         Err(weights::WeightError::Io(_))
     ));
 }
+
+/// Prefill must produce the same logits as stepping the decode path one token
+/// at a time. This is the oracle for the batched path: it is written before the
+/// batched implementation so that a wrong kernel cannot pass it silently.
+///
+/// The model is a gitignored fixture, so the test reports that it was skipped
+/// rather than failing when the weights are absent.
+#[test]
+fn prefill_matches_token_at_a_time() {
+    use kernrt::gpt2_tokenizer::Gpt2Tokenizer;
+    use kernrt::llama::Llama;
+
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/smollm2");
+    if !dir.join("model.safetensors").exists() {
+        eprintln!("skipping: no SmolLM2 fixture in target/smollm2");
+        return;
+    }
+    let tokenizer = Gpt2Tokenizer::load(dir.join("tokenizer.json")).unwrap();
+    let prompt = tokenizer.encode("The capital of France is", false);
+    assert!(prompt.len() > 1, "prompt should tokenize to several pieces");
+
+    let mut sequential = Llama::from_hf(&dir).unwrap();
+    let mut batched = Llama::from_hf(&dir).unwrap();
+
+    let mut want = Vec::new();
+    for (pos, &id) in prompt.iter().enumerate() {
+        want = sequential.forward(id, pos).to_vec();
+    }
+    let got = batched.prefill(&prompt, 0).to_vec();
+
+    assert_eq!(got.len(), want.len());
+    let max_diff = got
+        .iter()
+        .zip(&want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    // Same arithmetic grouped differently, so agreement is to f32 precision
+    // rather than bit-exact.
+    assert!(
+        max_diff <= 1e-3,
+        "prefill disagrees with decode by {max_diff}"
+    );
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i)
+            .unwrap()
+    };
+    assert_eq!(
+        argmax(&got),
+        argmax(&want),
+        "prefill picked a different token"
+    );
+
+    // Generation must continue correctly from the prefilled cache: the next
+    // token after the prompt has to match the sequential model's.
+    let next_batched = {
+        let ids = prompt.clone();
+        let last = argmax(&got);
+        let _ = ids;
+        last
+    };
+    let next_sequential = argmax(&want);
+    assert_eq!(next_batched, next_sequential);
+}

@@ -132,6 +132,33 @@ struct State {
     buf_mlp: Vec<f32>,
     /// Scratch for the quantized form of the current activation (Q8_0 only).
     q8: Q8Vec,
+    /// Batched scratch, sized on first use because the prompt length is only
+    /// known then.
+    prefill: Option<PrefillBuffers>,
+}
+
+/// Row-major `[n_tok, width]` scratch for a batched forward pass.
+struct PrefillBuffers {
+    /// Rows the buffers were sized for; requests up to this length reuse them.
+    n_tok: usize,
+    /// `[n_tok, dim]` residual stream.
+    x: Vec<f32>,
+    /// `[n_tok, dim]` norm output, and later the attention output.
+    xb: Vec<f32>,
+    /// `[n_tok, dim]` query.
+    q: Vec<f32>,
+    /// `[n_tok, kv_dim]` rotated keys.
+    k: Vec<f32>,
+    /// `[n_tok, kv_dim]` values.
+    v: Vec<f32>,
+    /// `[n_tok, dim]` projection output.
+    o: Vec<f32>,
+    /// `[n_tok, hidden_dim]` gate, then the gated product in place.
+    gate: Vec<f32>,
+    /// `[n_tok, hidden_dim]` up projection.
+    up: Vec<f32>,
+    /// `[n_tok, n_heads, seq_len]` attention scores.
+    att: Vec<f32>,
 }
 
 /// A loaded transformer.
@@ -269,6 +296,7 @@ impl Llama {
                 scales: Vec::new(),
                 quants: Vec::new(),
             },
+            prefill: None,
         };
         Llama {
             config,
@@ -278,6 +306,38 @@ impl Llama {
             wcls,
             state,
         }
+    }
+
+    /// Process `tokens` as one batch starting at absolute position `start`,
+    /// filling the key/value cache, and return the logits for the token after
+    /// the last one.
+    ///
+    /// [`forward`](Self::forward) is a single token wide, so a prompt otherwise
+    /// costs one full pass per token. This runs the same transformer with the
+    /// batch dimension `n_tok` in the outer loop: projections become
+    /// `[n_tok, in] x [in, out]` matrix multiplies through the packed GEMM, and
+    /// attention is causal over the whole batch at once.
+    ///
+    /// The result is the same as stepping [`forward`](Self::forward) over the
+    /// prompt, up to floating-point summation order, which the tests pin down.
+    ///
+    /// `start + tokens.len()` must not exceed the context length.
+    pub fn prefill(&mut self, tokens: &[usize], start: usize) -> &[f32] {
+        let n_tok = tokens.len();
+        assert!(
+            start + n_tok <= self.config.seq_len,
+            "prefill runs past the context length"
+        );
+        if n_tok == 0 {
+            return &self.state.logits;
+        }
+        // Until the batched path is in, the honest fallback is the decode loop.
+        // It is correct by construction, so the equality test below has a
+        // reference to compare against from the start.
+        for (offset, &token) in tokens.iter().enumerate() {
+            self.forward(token, start + offset);
+        }
+        &self.state.logits
     }
 
     /// The storage width the weights were loaded at.

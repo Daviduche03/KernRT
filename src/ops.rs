@@ -269,16 +269,19 @@ pub fn matmul_packed_nt(a: &Tensor, w: &Tensor) -> Result<Tensor, TensorError> {
                     let src = &lhs[(i0 + i) * k + p0..(i0 + i) * k + p0 + kc];
                     a_panel[i * kc..i * kc + kc].copy_from_slice(src);
                 }
-                // Each of the `nc` output columns is one row of `W`, so the pack
-                // gathers `W[j0 + j, p0..p0+kc]` — contiguous reads of the
-                // weight matrix, written transposed into the panel.
-                for j in 0..nc {
-                    let src = &weights[(j0 + j) * k + p0..(j0 + j) * k + p0 + kc];
-                    b_panel[j * kc..j * kc + kc].copy_from_slice(src);
+                // Each output column is one row of `W`, so `b_panel[p * nc + j]`
+                // must hold `W[j0 + j, p0 + p]`: a transpose during the pack.
+                // Looping `p` outer keeps the *writes* sequential, which is the
+                // half worth optimizing — the reads then come one row of `W` at
+                // a time and stay cache-resident. Writing `j` outer scattered
+                // across the whole panel and cost about half the throughput.
+                for p in 0..kc {
+                    let row = p0 + p;
+                    for j in 0..nc {
+                        b_panel[p * nc + j] = weights[(j0 + j) * k + row];
+                    }
                 }
-                // `packed_micro` expects a `kc x nc` panel, so the gather above
-                // is written column-major into it.
-                packed_micro_transposed(&a_panel, &b_panel, &mut out, n, mc, nc, kc, i0, j0);
+                packed_micro(&a_panel, &b_panel, &mut out, n, mc, nc, kc, i0, j0, p0);
             }
         }
     }
@@ -308,7 +311,12 @@ pub fn matmul_packed_nt(a: &Tensor, w: &Tensor) -> Result<Tensor, TensorError> {
 
 /// Micro-kernel over a panel pair where the `B` panel is stored so that panel
 /// column `j` is contiguous in `k` (i.e. transposed relative to [`packed_micro`]).
-#[allow(clippy::too_many_arguments)]
+///
+/// Retained as the reference for that layout: `matmul_packed_nt` used to pack
+/// into it, and it is what a column-major panel looks like unpacked. The live
+/// path packs `k`-major instead, which measured about twice as fast, so nothing
+/// calls this now.
+#[allow(dead_code, clippy::too_many_arguments)]
 fn packed_micro_transposed(
     a_panel: &[f32],
     b_panel: &[f32],

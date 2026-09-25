@@ -133,11 +133,17 @@ struct State {
     /// Scratch for the quantized form of the current activation (Q8_0 only).
     q8: Q8Vec,
     /// Batched scratch, sized on first use because the prompt length is only
-    /// known then.
+    /// known then. Not yet read: see `PrefillBuffers`.
+    #[allow(dead_code)]
     prefill: Option<PrefillBuffers>,
 }
 
 /// Row-major `[n_tok, width]` scratch for a batched forward pass.
+///
+/// Allocated but not yet consumed: the batched path is being built behind the
+/// equality test in `tests/end_to_end.rs`, and `prefill` still runs the decode
+/// loop. The `allow` goes away with that implementation.
+#[allow(dead_code)]
 struct PrefillBuffers {
     /// Rows the buffers were sized for; requests up to this length reuse them.
     n_tok: usize,

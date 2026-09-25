@@ -16,3 +16,7 @@ harness = false
 [[bench]]
 name = "model"
 harness = false
+
+[[bench]]
+name = "microkernel"
+harness = false

@@ -73,8 +73,27 @@ Both load with no code changes: the config parser and byte-level BPE were
 already generic, and the 360M's awkward `dim 960 / 15 heads / 5 KV heads`
 shape needed no special-casing.
 
-Prefill (128-token prompt): llama.cpp Q8_0 is 492 tok/s single-thread and
-1328 with four threads. We do not have prefill yet; see below.
+Prefill (128-token prompt) on CPU, 4 threads, interleaved. llama.cpp is Q8_0
+GGUF; ours is the best storage for the job, which is `q8_0x4` on the decode
+loop — the batched path only serves f32 and bf16, and there it is slower than
+the quantized decode loop (see below).
+
+| model | ours, best | ours, batched | llama.cpp Q8_0 | ratio |
+|---|---|---|---|---|
+| 135M | 274 (q8_0x4) | 218 (bf16) | 1207 | 4.4x |
+| 360M | 114 (q8_0x4) | 77 (bf16) | 512 | 4.5x |
+
+In GFLOP/s, which is what the kernel work should be judged on:
+
+| | 135M | 360M |
+|---|---|---|
+| llama.cpp | 326 | 371 |
+| ours, batched | 59 | 56 |
+
+llama.cpp's CPU prefill is faster in GFLOP/s at the larger model; ours is flat.
+An earlier version of this file reported "492 single-thread, 1328 four-thread"
+without naming a model, and the two were crossed: 492 is the 360M four-thread
+number and 1328 is the 135M one (re-measured here as 512 and 1207).
 
 ## The one bottleneck behind every remaining loss
 
@@ -99,31 +118,49 @@ The micro-kernel. Evidence:
 Raise `MR` to 12 or 16 and `NR` to 12, hand-write the NEON inner loop with
 explicit vector accumulators instead of relying on `mul_add` and the
 auto-vectorizer, and keep the f32 accumulators in registers across the whole
-`k` panel. Target: 200+ GFLOP/s, which would put prefill at llama.cpp's level
-and decode comfortably ahead.
+`k` panel.
+
+Target: llama.cpp's CPU prefill sits at 326-371 GFLOP/s, so "200+" was the
+wrong bar — it would still leave prefill about 2x behind. Aim at 350, which
+would put prefill at their level and decode comfortably ahead.
 
 Measure with `benches/model.rs` gemv shapes and a prefill-shape sweep, not by
 feel. The MR=8 -> 12 experiment in milestone 3 showed no gain for matmul, but
 that was before packing; the packed panels change which loop is hot.
 
-### 2. Rebuild prefill on top of it
+### 2. Rebuild prefill on top of it — DONE, independent of item 1
 
-The working version was measured at 885 ms for 128 tokens (144 tok/s) and
-matched step-by-step decode to 4.8e-5 with identical argmax, but it widened
-bf16 weights to f32 inside every projection: 211 conversions x 538 MB = 113 GB
-of copying per prompt, which dominated everything else.
+Built as planned: `PrefillWeights` holding one f32 copy of every projection
+built lazily on first use (~170 ms for 135M, once per session), flat `[n_tok,
+width]` scratch, and `gemm_nt_into` over the residual stream. 128 tokens for
+135M went from 1030 ms (124 tok/s) to 587 ms (218 tok/s).
 
-Rebuild as:
+One deviation: there is no `attention_batched`. The scores are causal, so row
+`i` reads `start..=start+i` and the rows never interact; the existing per-row
+`attention` is called in a loop with the score buffer reused. Batching it would
+have computed and discarded the masked half.
 
-* `PrefillWeights`, built once, holding f32 copies of every weight.
-* `prefill(tokens, start)` with `attention_batched` (causal over the batch).
-* `gemm_nt_into` wrapping the flat scratch buffers for the GEMM.
+The gate that matters, measured before writing any of it by timing the decode
+loop at every storage — batching is not automatically a win:
 
-Constraint: decode must not regress. Prefill gets its own buffers and does not
-touch the decode path.
+| storage | decode loop | batched | chosen |
+|---|---|---|---|
+| f32 | 87 tok/s | 218 | batched |
+| bf16 | 124 tok/s | 218 | batched |
+| q8_0 | 232 tok/s | 220 | loop |
+| q8_0x4 | 303 tok/s | 274 | loop |
 
-Then add a batched Q8_0 kernel so quantized models prefill too; for now Q8_0
-falls back to repeated `forward`.
+`q8_0x4`'s gemv decompresses weights as it reads them and reaches ~82 GFLOP/s
+against the batched f32 GEMM's ~55, so routing it through the batched path
+would have been a 10% regression reported as progress. This is the thing item 1
+changes: a GEMM that beats 82 GFLOP/s puts every storage on the batched path,
+including the one that is fastest today.
+
+Also measured: prefill throughput in GFLOP/s is flat across model size (59 at
+135M, 56 at 360M), so the batched path currently buys nothing from scale.
+
+Later: a batched Q8_0 kernel so the quantized storages prefill too. Until then
+they keep the loop, which for `q8_0x4` is still the fastest prefill we have.
 
 ### 3. Quantized prefill
 

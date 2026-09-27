@@ -15,7 +15,8 @@
 //! and row-major.
 //!
 //! Only `F32`, `BF16` and `F16` are read; each is widened to `f32`, which is
-//! what the kernels compute in. As in [`crate::weights`], the file is treated
+//! what the kernels compute in. As in [`crate::formats::weights`], the file is
+//! treated
 //! as untrusted: every offset and shape is checked against the file size before
 //! it is used to slice or allocate.
 

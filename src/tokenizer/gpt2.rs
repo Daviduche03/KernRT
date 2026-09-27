@@ -1,6 +1,7 @@
 //! A byte-level BPE tokenizer of the GPT-2 family, as SmolLM2 uses.
 //!
-//! This is a different animal from the llama2.c tokenizer in [`crate::tokenizer`]:
+//! This is a different animal from the llama2.c tokenizer in
+//! [`crate::tokenizer::byte_pair`]:
 //!
 //! * Bytes, not text, are the alphabet. Every one of the 256 bytes maps to a
 //!   printable "byte-level" codepoint (space becomes `Ġ`), so any input is

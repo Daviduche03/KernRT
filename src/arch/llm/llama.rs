@@ -7,12 +7,12 @@
 //! SiLU gating) live here because they are transformer-specific and operate on
 //! the state buffers in place.
 
-use crate::llama2c::{Checkpoint, LayerWeights, Llama2cError};
+use crate::formats::llama2c::{Checkpoint, LayerWeights, Llama2cError};
+use crate::formats::safetensors::{self, RawTensor, SafeTensorsError};
 use crate::ops::{
     Matrix, Q8_0_BLOCK, Q8Vec, dot, gemm_nt_into, gemm_q8_0x4_batched_into, gemv_into,
     gemv_q8_0_into, softmax_in_place,
 };
-use crate::safetensors::{self, RawTensor, SafeTensorsError};
 use crate::tensor::Tensor;
 use std::collections::HashMap;
 use std::fmt;
@@ -266,7 +266,7 @@ pub struct Llama {
 impl Llama {
     /// Load a llama2.c checkpoint (the TinyStories format).
     pub fn load(path: impl AsRef<Path>) -> Result<Self, Llama2cError> {
-        Ok(Self::from_checkpoint(crate::llama2c::load(path)?))
+        Ok(Self::from_checkpoint(crate::formats::llama2c::load(path)?))
     }
 
     /// Adopt a parsed llama2.c checkpoint. That format predates configurable

@@ -162,7 +162,7 @@ impl Mlp {
         Mlp::new(fc1, fc2)
     }
 
-    /// Build from tensors read by [`crate::safetensors::load`].
+    /// Build from tensors read by [`crate::formats::safetensors::load`].
     ///
     /// safetensors follows the PyTorch/MLX convention that `Linear.weight` is
     /// `[out_features, in_features]`, whereas this runtime's kernels want

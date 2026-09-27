@@ -9,15 +9,21 @@ gets against mature libraries.
 One model family (Llama-2 style: TinyStories, SmolLM2-135M and SmolLM2-360M),
 one device (CPU, NEON), one sequence at a time.
 
+Laid out by role: `ops` (kernels), `formats` (weight readers), `tokenizer`,
+`arch` (runnable networks), on top of `tensor`. The old flat paths
+(`kernrt::llama`, `kernrt::model`, ...) survive as re-exports in `lib.rs`.
+
 | piece | notes |
 |---|---|
 | `tensor.rs` | rank-2 f32 tensors, contiguous row-major |
-| `ops.rs` | matmul (scalar/tiled/packed/NEON), gemv, matvec, Q8_0 kernels, norms, softmax, transpose |
-| `llama.rs` | forward pass, GQA, RoPE (both layouts), KV cache |
-| `llama2c.rs` | TinyStories checkpoint reader |
-| `safetensors.rs` | HF reader, f32/f16/bf16 |
-| `tokenizer.rs` | llama2.c BPE |
-| `gpt2_tokenizer.rs` | HuggingFace byte-level BPE (SmolLM2) |
+| `ops/` | matmul (scalar/tiled/packed/NEON), gemv, Q8_0 kernels, norms, softmax, transpose |
+| `arch/llm/llama.rs` | forward pass, GQA, RoPE (both layouts), KV cache |
+| `arch/vision/mlp.rs` | dense classifier (MNIST) |
+| `formats/llama2c.rs` | TinyStories checkpoint reader |
+| `formats/safetensors.rs` | HF reader, f32/f16/bf16 |
+| `formats/weights.rs` | `.krt` tensor bundle reader/writer |
+| `tokenizer/byte_pair.rs` | llama2.c BPE |
+| `tokenizer/gpt2.rs` | HuggingFace byte-level BPE (SmolLM2) |
 | `generate.rs` | greedy and temperature sampling |
 
 Four weight storages behind `Matrix`: f32, bf16, Q8_0, Q8_0x4 (four rows

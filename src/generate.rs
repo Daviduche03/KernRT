@@ -1,6 +1,6 @@
 //! Text generation: turn logits into a token id, then loop.
 
-use crate::llama::Llama;
+use crate::arch::llm::llama::Llama;
 use crate::ops::softmax_in_place;
 use crate::tokenizer::Tokenizer;
 

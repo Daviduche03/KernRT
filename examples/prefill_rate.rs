@@ -44,9 +44,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     // prefill(prompt, 0) always writes positions 0..n, so repeating it on one
     // model is idempotent for the KV cache and avoids paying load time.
     //
-    // The first call is timed on its own: it is the one that pays the one-time
-    // f32 copy of every projection, and folding that into a best-of-N would
-    // report a rate no individual call ever achieves.
+    // The first call is timed on its own: f32/bf16 prefill builds its widened
+    // projection copies there, while native Q8_0x4 initializes its batch
+    // scratch. Folding that work into a best-of-N would report a rate no
+    // individual steady-state call ever achieves.
     let start = Instant::now();
     let logits = model.prefill(&prompt, 0);
     let first = start.elapsed().as_secs_f64();
@@ -63,10 +64,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let min = samples[0];
     let median = samples[samples.len() / 2];
     let toks = prompt.len() as f64;
-    println!(
-        "first call (includes one-time f32 weight copy): {:.1} ms",
-        first * 1e3
-    );
+    println!("first call (one-time prefill setup): {:.1} ms", first * 1e3);
     println!(
         "prefill: {:.1} ms best ({:.1} ms median) = {:.0} tok/s best, {:.0} median",
         min * 1e3,

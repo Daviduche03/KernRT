@@ -9,7 +9,8 @@
 
 use crate::llama2c::{Checkpoint, LayerWeights, Llama2cError};
 use crate::ops::{
-    Matrix, Q8_0_BLOCK, Q8Vec, dot, gemm_nt_into, gemv_into, gemv_q8_0_into, softmax_in_place,
+    Matrix, Q8_0_BLOCK, Q8Vec, dot, gemm_nt_into, gemm_q8_0x4_batched_into, gemv_into,
+    gemv_q8_0_into, softmax_in_place,
 };
 use crate::safetensors::{self, RawTensor, SafeTensorsError};
 use crate::tensor::Tensor;
@@ -168,6 +169,11 @@ struct PrefillBuffers {
     gate: Vec<f32>,
     /// `[n_tok, hidden_dim]` up projection.
     up: Vec<f32>,
+    /// Row-major Q8 activations for the native batched Q8_0x4 GEMM. The
+    /// quantizer is kept separately so filling a prompt is allocation-free.
+    q8_quants: Vec<i8>,
+    q8_scales_f16: Vec<u16>,
+    q8_batch: Q8Vec,
     /// `[n_heads, seq_len]` attention scores for the row being processed.
     att: Vec<f32>,
 }
@@ -213,6 +219,9 @@ impl PrefillBuffers {
             o: vec![0.0; n_tok * dim],
             gate: vec![0.0; n_tok * hidden],
             up: vec![0.0; n_tok * hidden],
+            q8_quants: vec![0; n_tok * hidden],
+            q8_scales_f16: vec![0; n_tok * hidden.div_ceil(Q8_0_BLOCK)],
+            q8_batch: Q8Vec::quantize(&[]),
             att: vec![0.0; config.n_heads * config.seq_len],
         }
     }
@@ -418,11 +427,9 @@ impl Llama {
         if n_tok == 0 {
             return &self.state.logits;
         }
-        // Q8 decode uses blockwise integer accumulation. Widening both inputs
-        // and weights for a batched f32 GEMM changes that accumulation enough
-        // to change logits across a deep model, so retain the exact Q8 path
-        // until it has a native batched Q8 kernel.
-        if !matches!(self.storage(), "f32" | "bf16") {
+        // Q8_0x4 has an exact batched integer path. Plain Q8_0 remains on the
+        // decode loop until it gains the same block-interleaved kernel.
+        if !matches!(self.storage(), "f32" | "bf16" | "q8_0x4") {
             for (offset, &token) in tokens.iter().enumerate() {
                 self.forward(token, start + offset);
             }
@@ -452,15 +459,19 @@ impl Llama {
         let rms_final = &self.rms_final;
         let classifier = self.wcls.as_ref().unwrap_or(&self.token_embedding);
         let layers = &self.layers;
+        let native_q8x4 = matches!(
+            layers.first().map(|layer| &layer.wq),
+            Some(Matrix::Q8_0x4(_))
+        );
         let state = &mut self.state;
 
-        if state.prefill_weights.is_none() {
+        if !native_q8x4 && state.prefill_weights.is_none() {
             state.prefill_weights = Some(PrefillWeights::build(layers));
         }
         if state.prefill.as_ref().is_none_or(|p| p.n_tok < n_tok) {
             state.prefill = Some(PrefillBuffers::new(n_tok, &config));
         }
-        let weights = state.prefill_weights.as_ref().expect("built above");
+        let weights = state.prefill_weights.as_ref();
         let pf = state.prefill.as_mut().expect("built above");
         // Split out so attention can take this row's query and that row's
         // output at the same time, which a second borrow of `pf` would not
@@ -474,6 +485,9 @@ impl Llama {
             o,
             gate,
             up,
+            q8_quants,
+            q8_scales_f16,
+            q8_batch,
             att,
             ..
         } = pf;
@@ -484,7 +498,7 @@ impl Llama {
         }
 
         for (l, layer) in layers.iter().take(config.n_layers).enumerate() {
-            let w = &weights.layers[l];
+            let w = weights.map(|weights| &weights.layers[l]);
             let loff = l * seq_len * kv_dim;
 
             // Attention RMSNorm, one row at a time: it is element-wise, so
@@ -500,9 +514,36 @@ impl Llama {
                 );
             }
 
-            gemm_nt_into(xb, &w.wq, q, n_tok, dim, dim);
-            gemm_nt_into(xb, &w.wk, k, n_tok, dim, kv_dim);
-            gemm_nt_into(xb, &w.wv, v, n_tok, dim, kv_dim);
+            if native_q8x4 {
+                quantize_rows_q8(q8_batch, xb, q8_quants, q8_scales_f16, dim);
+            }
+            batched_project(
+                &layer.wq,
+                w.map(|w| w.wq.as_slice()),
+                &*xb,
+                q8_quants,
+                q8_scales_f16,
+                n_tok,
+                q,
+            );
+            batched_project(
+                &layer.wk,
+                w.map(|w| w.wk.as_slice()),
+                &*xb,
+                q8_quants,
+                q8_scales_f16,
+                n_tok,
+                k,
+            );
+            batched_project(
+                &layer.wv,
+                w.map(|w| w.wv.as_slice()),
+                &*xb,
+                q8_quants,
+                q8_scales_f16,
+                n_tok,
+                v,
+            );
 
             // RoPE rotates q and k before k is cached, matching both
             // references, so it runs over the batched rows before any row
@@ -549,7 +590,18 @@ impl Llama {
                 );
             }
 
-            gemm_nt_into(xb, &w.wo, o, n_tok, dim, dim);
+            if native_q8x4 {
+                quantize_rows_q8(q8_batch, xb, q8_quants, q8_scales_f16, dim);
+            }
+            batched_project(
+                &layer.wo,
+                w.map(|w| w.wo.as_slice()),
+                &*xb,
+                q8_quants,
+                q8_scales_f16,
+                n_tok,
+                o,
+            );
             for (residual, &add) in x.iter_mut().zip(o.iter()) {
                 *residual += add;
             }
@@ -564,12 +616,42 @@ impl Llama {
                     config.rms_eps,
                 );
             }
-            gemm_nt_into(xb, &w.w1, gate, n_tok, dim, hidden);
-            gemm_nt_into(xb, &w.w3, up, n_tok, dim, hidden);
+            if native_q8x4 {
+                quantize_rows_q8(q8_batch, xb, q8_quants, q8_scales_f16, dim);
+            }
+            batched_project(
+                &layer.w1,
+                w.map(|w| w.w1.as_slice()),
+                &*xb,
+                q8_quants,
+                q8_scales_f16,
+                n_tok,
+                gate,
+            );
+            batched_project(
+                &layer.w3,
+                w.map(|w| w.w3.as_slice()),
+                &*xb,
+                q8_quants,
+                q8_scales_f16,
+                n_tok,
+                up,
+            );
             for (g, &u) in gate.iter_mut().zip(up.iter()) {
                 *g = silu(*g) * u;
             }
-            gemm_nt_into(gate, &w.w2, o, n_tok, hidden, dim);
+            if native_q8x4 {
+                quantize_rows_q8(q8_batch, gate, q8_quants, q8_scales_f16, hidden);
+            }
+            batched_project(
+                &layer.w2,
+                w.map(|w| w.w2.as_slice()),
+                &*gate,
+                q8_quants,
+                q8_scales_f16,
+                n_tok,
+                o,
+            );
             for (residual, &add) in x.iter_mut().zip(o.iter()) {
                 *residual += add;
             }
@@ -736,6 +818,62 @@ fn project_with(w: &Matrix, q8: &Q8Vec, x: &[f32], y: &mut [f32]) {
 fn quantize_for(q8: &mut Q8Vec, w: &Matrix, x: &[f32]) {
     if matches!(w, Matrix::Q8_0 { .. } | Matrix::Q8_0x4(_)) {
         q8.quantize_into(x);
+    }
+}
+
+/// Quantize a prompt's activation rows into the contiguous form consumed by
+/// the batched Q8_0x4 kernel. Transformer projection widths are block aligned;
+/// keeping that invariant here makes every kernel inner loop branch-free.
+fn quantize_rows_q8(
+    q8: &mut Q8Vec,
+    input: &[f32],
+    quants: &mut [i8],
+    scales_f16: &mut [u16],
+    width: usize,
+) {
+    debug_assert_eq!(width % Q8_0_BLOCK, 0);
+    debug_assert_eq!(input.len() % width, 0);
+    let blocks = width / Q8_0_BLOCK;
+    let rows = input.len() / width;
+    for row in 0..rows {
+        q8.quantize_into(&input[row * width..(row + 1) * width]);
+        quants[row * width..(row + 1) * width].copy_from_slice(&q8.quants[..width]);
+        scales_f16[row * blocks..(row + 1) * blocks].copy_from_slice(&q8.scales_f16[..blocks]);
+    }
+}
+
+/// Dispatch one projection during prefill. The Q8_0x4 branch preserves decode
+/// arithmetic exactly while reusing each packed weight block across all prompt
+/// rows; wider storages use their pre-expanded GEMM weights.
+fn batched_project(
+    matrix: &Matrix,
+    widened: Option<&[f32]>,
+    input: &[f32],
+    quants: &[i8],
+    scales_f16: &[u16],
+    rows: usize,
+    out: &mut [f32],
+) {
+    match matrix {
+        Matrix::Q8_0x4(packed) => {
+            let in_dim = packed.in_dim();
+            let blocks = in_dim / Q8_0_BLOCK;
+            gemm_q8_0x4_batched_into(
+                packed,
+                &quants[..rows * in_dim],
+                &scales_f16[..rows * blocks],
+                rows,
+                out,
+            );
+        }
+        _ => gemm_nt_into(
+            input,
+            widened.expect("non-Q8 prefill requires widened weights"),
+            out,
+            rows,
+            matrix.in_dim(),
+            matrix.out_dim(),
+        ),
     }
 }
 

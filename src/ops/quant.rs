@@ -206,6 +206,62 @@ fn gemv_q8_0x4(packed: &Q8_0x4, qx: &Q8Vec, y: &mut [f32]) {
     }
 }
 
+/// Batched Q8_0x4 matrix product with pre-quantized activations.
+///
+/// `quants` and `scales_f16` hold `rows` consecutive Q8_0 vectors. Unlike
+/// calling GEMV once per row, this walks one weight block and applies it to
+/// every activation row while the 136-byte block is hot in L1. The operation
+/// order for an individual output is still identical to [`gemv_q8_0x4`]: one
+/// integer dot and one f32 FMA per quantization block.
+pub fn gemm_q8_0x4_batched_into(
+    packed: &Q8_0x4,
+    quants: &[i8],
+    scales_f16: &[u16],
+    rows: usize,
+    y: &mut [f32],
+) {
+    let blocks = packed.in_dim / Q8_0_BLOCK;
+    debug_assert_eq!(quants.len(), rows * packed.in_dim);
+    debug_assert_eq!(scales_f16.len(), rows * blocks);
+    debug_assert_eq!(y.len(), rows * packed.out_dim);
+
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("dotprod")
+        && std::arch::is_aarch64_feature_detected!("fp16")
+    {
+        // SAFETY: feature detection plus the shape assertions above.
+        unsafe { gemm_q8_0x4_batched_neon(packed, quants, scales_f16, rows, y) };
+        return;
+    }
+
+    // Portable reference. This keeps the same blockwise accumulation as the
+    // NEON path and is also useful when running the test suite on x86.
+    for row in 0..rows {
+        for group in 0..packed.out_dim / 4 {
+            let out =
+                &mut y[row * packed.out_dim + group * 4..row * packed.out_dim + group * 4 + 4];
+            out.fill(0.0);
+            for block in 0..blocks {
+                let weights = &packed.blocks[group * blocks + block];
+                let xs = f16_scale_to_f32(scales_f16[row * blocks + block]);
+                for (lane, slot) in out.iter_mut().enumerate() {
+                    let ws = f16_scale_to_f32(weights.scales[lane]) * xs;
+                    let mut sum = 0i32;
+                    for segment in 0..8 {
+                        for byte in 0..4 {
+                            sum += i32::from(weights.quants[segment * 16 + lane * 4 + byte])
+                                * i32::from(
+                                    quants[row * packed.in_dim + block * 32 + segment * 4 + byte],
+                                );
+                        }
+                    }
+                    *slot = (sum as f32).mul_add(ws, *slot);
+                }
+            }
+        }
+    }
+}
+
 /// SDOT-lane-broadcast GEMV, four rows per activation block load.
 ///
 /// SAFETY: dotprod is available; dimensions and buffers were validated by the
@@ -253,6 +309,40 @@ unsafe fn q8_0x4_block_dot(
     unsafe { super::dot::sdot_lane::<3>(sums, w7, x1) }
 }
 
+/// Same four-output integer dot as [`q8_0x4_block_dot`], but with an activation
+/// pointer supplied by the batched kernel rather than a `Q8Vec` wrapper.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn q8_0x4_block_dot_raw(
+    block_data: &Q8Block4,
+    x: *const i8,
+) -> core::arch::aarch64::int32x4_t {
+    use core::arch::aarch64::{vdupq_n_s32, vld1q_s8};
+    let (x0, x1) = unsafe { (vld1q_s8(x), vld1q_s8(x.add(16))) };
+    let wp = block_data.quants.as_ptr();
+    let (w0, w1, w2, w3, w4, w5, w6, w7) = unsafe {
+        (
+            vld1q_s8(wp),
+            vld1q_s8(wp.add(16)),
+            vld1q_s8(wp.add(32)),
+            vld1q_s8(wp.add(48)),
+            vld1q_s8(wp.add(64)),
+            vld1q_s8(wp.add(80)),
+            vld1q_s8(wp.add(96)),
+            vld1q_s8(wp.add(112)),
+        )
+    };
+    let mut sums = unsafe { vdupq_n_s32(0) };
+    sums = unsafe { super::dot::sdot_lane::<0>(sums, w0, x0) };
+    sums = unsafe { super::dot::sdot_lane::<1>(sums, w1, x0) };
+    sums = unsafe { super::dot::sdot_lane::<2>(sums, w2, x0) };
+    sums = unsafe { super::dot::sdot_lane::<3>(sums, w3, x0) };
+    sums = unsafe { super::dot::sdot_lane::<0>(sums, w4, x1) };
+    sums = unsafe { super::dot::sdot_lane::<1>(sums, w5, x1) };
+    sums = unsafe { super::dot::sdot_lane::<2>(sums, w6, x1) };
+    unsafe { super::dot::sdot_lane::<3>(sums, w7, x1) }
+}
+
 #[cfg(target_arch = "aarch64")]
 unsafe fn gemv_q8_0x4_neon(packed: &Q8_0x4, qx: &Q8Vec, y: &mut [f32]) {
     use core::arch::aarch64::{vcvtq_f32_s32, vdupq_n_f32, vfmaq_f32, vmulq_f32, vst1q_f32};
@@ -265,9 +355,110 @@ unsafe fn gemv_q8_0x4_neon(packed: &Q8_0x4, qx: &Q8Vec, y: &mut [f32]) {
             let xs = unsafe { widen_scale_dup(qx.scales_f16[block]) };
             total = unsafe { vfmaq_f32(total, vcvtq_f32_s32(d), vmulq_f32(ws, xs)) };
         }
-        let mut lanes = [0.0f32; 4];
-        unsafe { vst1q_f32(lanes.as_mut_ptr(), total) };
-        y[group * 4..group * 4 + 4].copy_from_slice(&lanes);
+        // Store the four lanes directly into the output row; the old temporary
+        // array added a second copy to every output group in decode.
+        unsafe { vst1q_f32(y.as_mut_ptr().add(group * 4), total) };
+    }
+}
+
+/// Register-blocked Q8_0x4 GEMM. Four prompt rows stay in independent NEON
+/// accumulators while walking a weight group's blocks. This hides SDOT latency
+/// and eliminates a partial-output load/store after every quantization block.
+#[cfg(target_arch = "aarch64")]
+unsafe fn gemm_q8_0x4_batched_neon(
+    packed: &Q8_0x4,
+    quants: &[i8],
+    scales_f16: &[u16],
+    rows: usize,
+    y: &mut [f32],
+) {
+    use core::arch::aarch64::{vcvtq_f32_s32, vdupq_n_f32, vfmaq_f32, vmulq_f32, vst1q_f32};
+    let blocks = packed.in_dim / Q8_0_BLOCK;
+    for group in 0..packed.out_dim / 4 {
+        let mut row = 0;
+        while row + 4 <= rows {
+            let mut total0 = unsafe { vdupq_n_f32(0.0) };
+            let mut total1 = unsafe { vdupq_n_f32(0.0) };
+            let mut total2 = unsafe { vdupq_n_f32(0.0) };
+            let mut total3 = unsafe { vdupq_n_f32(0.0) };
+            for block in 0..blocks {
+                let weight = &packed.blocks[group * blocks + block];
+                let ws = unsafe { widen_scale4(weight.scales.as_ptr()) };
+                let qbase = quants
+                    .as_ptr()
+                    .wrapping_add(row * packed.in_dim + block * 32);
+                let d0 = unsafe { q8_0x4_block_dot_raw(weight, qbase) };
+                let d1 = unsafe { q8_0x4_block_dot_raw(weight, qbase.add(packed.in_dim)) };
+                let d2 = unsafe { q8_0x4_block_dot_raw(weight, qbase.add(2 * packed.in_dim)) };
+                let d3 = unsafe { q8_0x4_block_dot_raw(weight, qbase.add(3 * packed.in_dim)) };
+                let s = row * blocks + block;
+                total0 = unsafe {
+                    vfmaq_f32(
+                        total0,
+                        vcvtq_f32_s32(d0),
+                        vmulq_f32(ws, widen_scale_dup(scales_f16[s])),
+                    )
+                };
+                total1 = unsafe {
+                    vfmaq_f32(
+                        total1,
+                        vcvtq_f32_s32(d1),
+                        vmulq_f32(ws, widen_scale_dup(scales_f16[s + blocks])),
+                    )
+                };
+                total2 = unsafe {
+                    vfmaq_f32(
+                        total2,
+                        vcvtq_f32_s32(d2),
+                        vmulq_f32(ws, widen_scale_dup(scales_f16[s + 2 * blocks])),
+                    )
+                };
+                total3 = unsafe {
+                    vfmaq_f32(
+                        total3,
+                        vcvtq_f32_s32(d3),
+                        vmulq_f32(ws, widen_scale_dup(scales_f16[s + 3 * blocks])),
+                    )
+                };
+            }
+            unsafe {
+                vst1q_f32(y.as_mut_ptr().add(row * packed.out_dim + group * 4), total0);
+                vst1q_f32(
+                    y.as_mut_ptr().add((row + 1) * packed.out_dim + group * 4),
+                    total1,
+                );
+                vst1q_f32(
+                    y.as_mut_ptr().add((row + 2) * packed.out_dim + group * 4),
+                    total2,
+                );
+                vst1q_f32(
+                    y.as_mut_ptr().add((row + 3) * packed.out_dim + group * 4),
+                    total3,
+                );
+            }
+            row += 4;
+        }
+        while row < rows {
+            let mut total = unsafe { vdupq_n_f32(0.0) };
+            for block in 0..blocks {
+                let weight = &packed.blocks[group * blocks + block];
+                let d = unsafe {
+                    q8_0x4_block_dot_raw(
+                        weight,
+                        quants.as_ptr().add(row * packed.in_dim + block * 32),
+                    )
+                };
+                let scale = unsafe {
+                    vmulq_f32(
+                        widen_scale4(weight.scales.as_ptr()),
+                        widen_scale_dup(scales_f16[row * blocks + block]),
+                    )
+                };
+                total = unsafe { vfmaq_f32(total, vcvtq_f32_s32(d), scale) };
+            }
+            unsafe { vst1q_f32(y.as_mut_ptr().add(row * packed.out_dim + group * 4), total) };
+            row += 1;
+        }
     }
 }
 

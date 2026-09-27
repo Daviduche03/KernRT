@@ -25,7 +25,10 @@ pub use dense::{
 };
 pub(crate) use elementwise::softmax_in_place;
 pub use elementwise::{add_bias, relu, softmax};
-pub use quant::{Matrix, Q8_0_BLOCK, Q8_0X4_ROWS, Q8Vec, gemv, gemv_into, gemv_q8_0_into};
+pub use quant::{
+    Matrix, Q8_0_BLOCK, Q8_0X4_ROWS, Q8Vec, gemm_q8_0x4_batched_into, gemv, gemv_into,
+    gemv_q8_0_into,
+};
 
 #[allow(unused_imports)]
 pub(crate) use dot::{

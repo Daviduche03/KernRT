@@ -3,7 +3,12 @@
 //! ```text
 //! cargo run --release --example smollm2_generate -- "Once upon a time"
 //! KERNRT_Q8_0=1 cargo run --release --example smollm2_generate -- "The capital of France is"
+//! cargo run --release --example smollm2_generate -- "Once upon a time" 100 0.8 7
 //! ```
+//!
+//! Arguments are `prompt`, `steps`, then `temperature` and `seed`. Temperature
+//! 0 (the default) is greedy argmax and reproduces byte-identical output on
+//! every run; above 0 the seed picks the random stream.
 
 use kernrt::generate::Sampler;
 use kernrt::gpt2_tokenizer::Gpt2Tokenizer;
@@ -14,18 +19,18 @@ use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/smollm2");
-    let prompt = std::env::args()
-        .nth(1)
+    let mut args = std::env::args().skip(1);
+    let prompt = args
+        .next()
         .unwrap_or_else(|| "Once upon a time".to_string());
-    let steps: usize = std::env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(48);
+    let steps: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(48);
+    let temperature: f32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let seed: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(42);
 
     let mut model = Llama::from_hf(&dir)?;
     let tokenizer = Gpt2Tokenizer::load(dir.join("tokenizer.json"))?;
     println!(
-        "storage {} | vocab {} | prompt {prompt:?}",
+        "storage {} | vocab {} | prompt {prompt:?} | temp {temperature}",
         model.storage(),
         tokenizer.vocab_size()
     );
@@ -33,7 +38,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let prompt_tokens = tokenizer.encode(&prompt, false);
     println!("prompt tokens: {prompt_tokens:?}");
 
-    let mut sampler = Sampler::greedy();
+    let mut sampler = if temperature > 0.0 {
+        Sampler::temperature(temperature, seed)
+    } else {
+        Sampler::greedy()
+    };
     let start = Instant::now();
     let completion = run_generation(&mut model, &tokenizer, &mut sampler, &prompt_tokens, steps);
     let elapsed = start.elapsed();

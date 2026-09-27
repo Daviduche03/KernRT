@@ -235,9 +235,29 @@ pub fn matmul_packed_nt(a: &Tensor, w: &Tensor) -> Result<Tensor, TensorError> {
     }
     let (m, k) = (ash[0], ash[1]);
     let n = wsh[0];
-    let lhs = a.data();
-    let weights = w.data();
     let mut out = vec![0.0f32; m * n];
+    gemm_nt_into(a.data(), w.data(), &mut out, m, k, n);
+    Tensor::from_vec(out, &[m, n])
+}
+
+/// Slice-based core of [`matmul_packed_nt`]: `lhs[m, k] * weights[n, k]^T`
+/// written into `out[m, n]`.
+///
+/// Exists so a caller holding flat scratch buffers — the prefill path, which
+/// keeps `[n_tok, width]` rows for a whole prompt — can run the same kernel
+/// without moving those buffers in and out of a `Tensor` at every layer.
+///
+/// `out` is zeroed first, because the micro-kernel accumulates into it across
+/// `k` blocks while the scalar edge cases assign; both need a known start.
+///
+/// # Panics
+///
+/// Panics on a debug build if the slice lengths disagree with the shapes.
+pub fn gemm_nt_into(lhs: &[f32], weights: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) {
+    debug_assert_eq!(lhs.len(), m * k, "lhs must be m x k");
+    debug_assert_eq!(weights.len(), n * k, "weights must be n x k");
+    debug_assert_eq!(out.len(), m * n, "out must be m x n");
+    out.fill(0.0);
 
     let i_full = m - m % MR;
     let j_full = n - n % NR;
@@ -253,7 +273,7 @@ pub fn matmul_packed_nt(a: &Tensor, w: &Tensor) -> Result<Tensor, TensorError> {
                 out[i * n + j] = acc;
             }
         }
-        return Tensor::from_vec(out, &[m, n]);
+        return;
     }
 
     let mut a_panel = vec![0.0f32; GEMM_MC * GEMM_KC];
@@ -281,7 +301,7 @@ pub fn matmul_packed_nt(a: &Tensor, w: &Tensor) -> Result<Tensor, TensorError> {
                         b_panel[p * nc + j] = weights[(j0 + j) * k + row];
                     }
                 }
-                packed_micro(&a_panel, &b_panel, &mut out, n, mc, nc, kc, i0, j0, p0);
+                packed_micro(&a_panel, &b_panel, out, n, mc, nc, kc, i0, j0, p0);
             }
         }
     }
@@ -306,7 +326,6 @@ pub fn matmul_packed_nt(a: &Tensor, w: &Tensor) -> Result<Tensor, TensorError> {
             }
         }
     }
-    Tensor::from_vec(out, &[m, n])
 }
 
 /// Micro-kernel over a panel pair where the `B` panel is stored so that panel

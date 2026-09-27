@@ -20,7 +20,8 @@ mod elementwise;
 mod quant;
 
 pub use dense::{
-    matmul, matmul_neon, matmul_packed, matmul_packed_nt, matmul_tiled, matvec, transpose,
+    gemm_nt_into, matmul, matmul_neon, matmul_packed, matmul_packed_nt, matmul_tiled, matvec,
+    transpose,
 };
 pub(crate) use elementwise::softmax_in_place;
 pub use elementwise::{add_bias, relu, softmax};
@@ -159,6 +160,49 @@ mod tests {
             assert_eq!(got.shape(), reference.shape());
             assert_close(&got, &reference, &format!("{m}x{k}x{n}"));
         }
+    }
+
+    /// The slice-based core must agree with the `Tensor` wrapper it backs.
+    ///
+    /// `out` arrives deliberately dirty: the micro-kernel accumulates into it
+    /// across `k` blocks, so a missing zeroing would show up as a large error
+    /// here rather than a rounding-sized one.
+    #[test]
+    fn gemm_nt_into_matches_matmul_packed_nt() {
+        for (m, k, n) in [
+            (1usize, 1usize, 1usize),
+            (3, 5, 7),
+            (8, 8, 8),
+            (17, 19, 23),
+            (33, 17, 9),
+            (64, 64, 64),
+            (65, 257, 513),
+            (128, 576, 1536),
+        ] {
+            let a = random(&[m, k], 21);
+            let w = random(&[n, k], 22);
+            let want = matmul_packed_nt(&a, &w).unwrap();
+            let mut out = vec![7.5f32; m * n];
+            gemm_nt_into(a.data(), w.data(), &mut out, m, k, n);
+            let got = Tensor::from_vec(out, &[m, n]).unwrap();
+            assert_close(&got, &want, &format!("gemm_nt_into {m}x{k}x{n}"));
+        }
+    }
+
+    /// The prefill path reuses one output buffer across layers, so a second
+    /// call must not accumulate the first one's results.
+    #[test]
+    fn gemm_nt_into_overwrites_previous_results() {
+        let a = random(&[16, 32], 3);
+        let w = random(&[24, 32], 4);
+        let want = matmul_packed_nt(&a, &w).unwrap();
+
+        let mut out = vec![0.0f32; 16 * 24];
+        for _ in 0..3 {
+            gemm_nt_into(a.data(), w.data(), &mut out, 16, 32, 24);
+        }
+        let got = Tensor::from_vec(out, &[16, 24]).unwrap();
+        assert_close(&got, &want, "repeated calls");
     }
 
     /// The packed GEMM must agree with the reference on the same shape grid,

@@ -4,10 +4,10 @@
 //! cargo run --release --example mlp_infer
 //! ```
 
-use kernrt::model::Mlp;
+use kernrt::arch::vision::mlp::Mlp;
+use kernrt::formats::weights;
 use kernrt::ops::softmax;
 use kernrt::tensor::Tensor;
-use kernrt::weights;
 use std::error::Error;
 use std::hint::black_box;
 use std::path::PathBuf;

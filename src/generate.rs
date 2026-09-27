@@ -1,6 +1,6 @@
 //! Text generation: turn logits into a token id, then loop.
 
-use crate::arch::llm::llama::Llama;
+use crate::arch::llm::LanguageModel;
 use crate::ops::softmax_in_place;
 use crate::tokenizer::Tokenizer;
 
@@ -77,8 +77,8 @@ pub fn argmax(values: &[f32]) -> usize {
 ///
 /// Like `run.c`, the returned text starts at the prompt's second token, so it
 /// contains the prompt continuation followed by the generated words.
-pub fn generate(
-    model: &mut Llama,
+pub fn generate<M: LanguageModel>(
+    model: &mut M,
     tokenizer: &Tokenizer,
     sampler: &mut Sampler,
     prompt: &str,
@@ -88,7 +88,7 @@ pub fn generate(
     let mut bytes = Vec::new();
     let mut token = prompt_tokens[0];
     let mut pos = 0;
-    while pos < steps.min(model.config().seq_len) {
+    while pos < steps.min(model.context_len()) {
         // The next token is forced while the prompt is still being consumed.
         let next = {
             let logits = model.forward(token, pos);

@@ -5,8 +5,8 @@
 //! KERNRT_Q8_0X4=1 cargo run --release --example decode_rate
 //! ```
 
-use kernrt::gpt2_tokenizer::Gpt2Tokenizer;
-use kernrt::llama::Llama;
+use kernrt::arch::llm::Llama;
+use kernrt::tokenizer::Gpt2Tokenizer;
 use std::error::Error;
 use std::hint::black_box;
 use std::path::PathBuf;

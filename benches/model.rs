@@ -1,5 +1,5 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use kernrt::model::{Linear, Mlp};
+use kernrt::arch::vision::mlp::{Linear, Mlp};
 use kernrt::ops::{Matrix, gemv, matmul_tiled, matvec, softmax};
 use kernrt::tensor::Tensor;
 use std::hint::black_box;

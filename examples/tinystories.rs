@@ -8,7 +8,7 @@
 //! Expects `target/stories15M.bin` and `target/ref_logits.txt`, produced by the
 //! steps documented in `scripts/dump_logits.c`.
 
-use kernrt::llama::Llama;
+use kernrt::arch::llm::Llama;
 use std::error::Error;
 use std::hint::black_box;
 use std::path::PathBuf;

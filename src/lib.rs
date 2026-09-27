@@ -11,11 +11,3 @@ pub mod generate;
 pub mod ops;
 pub mod tensor;
 pub mod tokenizer;
-
-// The file move above is invisible to callers: these aliases keep every
-// pre-existing path — `kernrt::llama`, `kernrt::model`, `kernrt::safetensors`,
-// `kernrt::weights`, `kernrt::llama2c`, `kernrt::gpt2_tokenizer` — resolving.
-pub use arch::llm::llama;
-pub use arch::vision::mlp as model;
-pub use formats::{llama2c, safetensors, weights};
-pub use tokenizer::gpt2 as gpt2_tokenizer;

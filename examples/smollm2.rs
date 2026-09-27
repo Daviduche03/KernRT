@@ -5,7 +5,7 @@
 //! cargo run --release --example smollm2
 //! ```
 
-use kernrt::llama::Llama;
+use kernrt::arch::llm::Llama;
 use std::error::Error;
 use std::hint::black_box;
 use std::path::PathBuf;

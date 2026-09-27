@@ -10,9 +10,9 @@
 //! 0 (the default) is greedy argmax and reproduces byte-identical output on
 //! every run; above 0 the seed picks the random stream.
 
+use kernrt::arch::llm::Llama;
 use kernrt::generate::Sampler;
-use kernrt::gpt2_tokenizer::Gpt2Tokenizer;
-use kernrt::llama::Llama;
+use kernrt::tokenizer::Gpt2Tokenizer;
 use std::error::Error;
 use std::path::PathBuf;
 use std::time::Instant;

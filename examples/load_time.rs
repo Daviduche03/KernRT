@@ -1,5 +1,5 @@
 //! Time loading SmolLM2, separated into parse and widen.
-use kernrt::llama::Llama;
+use kernrt::arch::llm::Llama;
 use std::path::PathBuf;
 use std::time::Instant;
 

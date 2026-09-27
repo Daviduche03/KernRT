@@ -6,8 +6,8 @@
 //! cargo run --release --example tinystories_generate -- "Once upon a time" 40 0.8
 //! ```
 
+use kernrt::arch::llm::Llama;
 use kernrt::generate::{Sampler, generate};
-use kernrt::llama::Llama;
 use kernrt::tokenizer::Tokenizer;
 use std::error::Error;
 use std::path::PathBuf;

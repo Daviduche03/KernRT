@@ -7,6 +7,7 @@
 //! SiLU gating) live here because they are transformer-specific and operate on
 //! the state buffers in place.
 
+use super::LanguageModel;
 use crate::formats::llama2c::{Checkpoint, LayerWeights, Llama2cError};
 use crate::formats::safetensors::{self, RawTensor, SafeTensorsError};
 use crate::ops::{
@@ -1145,6 +1146,16 @@ fn rope_half(vec: &mut [f32], pos: usize, head_size: usize, theta: f32) {
             head[i] = lo * cos - hi * sin;
             head[i + half] = lo * sin + hi * cos;
         }
+    }
+}
+
+impl LanguageModel for Llama {
+    fn forward(&mut self, token: usize, pos: usize) -> &[f32] {
+        Llama::forward(self, token, pos)
+    }
+
+    fn context_len(&self) -> usize {
+        self.config.seq_len
     }
 }
 

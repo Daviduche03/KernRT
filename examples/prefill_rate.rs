@@ -7,8 +7,8 @@
 //! KERNRT_Q8_0X4=1 cargo run --release --example prefill_rate -- 128
 //! ```
 
-use kernrt::gpt2_tokenizer::Gpt2Tokenizer;
-use kernrt::llama::Llama;
+use kernrt::arch::llm::Llama;
+use kernrt::tokenizer::Gpt2Tokenizer;
 use std::error::Error;
 use std::path::PathBuf;
 use std::time::Instant;

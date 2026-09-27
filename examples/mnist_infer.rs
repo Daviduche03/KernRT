@@ -6,8 +6,8 @@
 //! cargo run --release --example mnist_infer
 //! ```
 
-use kernrt::model::Mlp;
-use kernrt::safetensors;
+use kernrt::arch::vision::mlp::Mlp;
+use kernrt::formats::safetensors;
 use kernrt::tensor::Tensor;
 use std::error::Error;
 use std::hint::black_box;

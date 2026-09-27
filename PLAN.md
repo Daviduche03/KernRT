@@ -1,8 +1,14 @@
 # KernRT — status and plan
 
-A hand-written Rust inference runtime for Apple Silicon. No BLAS, no
-Accelerate, no MLX: every kernel is ours, and the point is to see how far that
-gets against mature libraries.
+A hand-written Rust inference runtime for Apple Silicon. No BLAS, no MLX:
+every kernel is ours, and the point is to see how far that gets against mature
+libraries.
+
+One deviation, recorded rather than implied: `gemm_nt_into` (the f32/bf16
+prefill GEMM) calls Accelerate's `cblas_sgemm` on macOS — commit `5a0e831` — so
+those dense projections run on the AMX unit. Decode, the packed kernels and
+every quantized path stay hand-written, and the portable kernel remains for
+other targets.
 
 ## What exists
 
@@ -10,8 +16,9 @@ One model family (Llama-2 style: TinyStories, SmolLM2-135M and SmolLM2-360M),
 one device (CPU, NEON), one sequence at a time.
 
 Laid out by role: `ops` (kernels), `formats` (weight readers), `tokenizer`,
-`arch` (runnable networks), on top of `tensor`. The old flat paths
-(`kernrt::llama`, `kernrt::model`, ...) survive as re-exports in `lib.rs`.
+`arch` (runnable networks), on top of `tensor`. `arch` is split by family
+(`llm`, `vision`); a decoder implements `arch::llm::LanguageModel`, which is
+all the `generate` loop needs, so it never names a concrete architecture.
 
 | piece | notes |
 |---|---|

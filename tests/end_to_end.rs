@@ -2,9 +2,9 @@
 //! logits. Unlike the unit tests, this goes through the real filesystem, which
 //! is the only place `weights::save`/`load` differ from the in-memory codec.
 
-use kernrt::model::Mlp;
+use kernrt::arch::vision::mlp::Mlp;
+use kernrt::formats::weights;
 use kernrt::tensor::Tensor;
-use kernrt::weights;
 use std::path::PathBuf;
 
 fn tensor(data: Vec<f32>, shape: &[usize]) -> Tensor {
@@ -55,8 +55,8 @@ fn missing_file_is_an_io_error() {
 /// rather than failing when the weights are absent.
 #[test]
 fn prefill_matches_token_at_a_time() {
-    use kernrt::gpt2_tokenizer::Gpt2Tokenizer;
-    use kernrt::llama::Llama;
+    use kernrt::arch::llm::Llama;
+    use kernrt::tokenizer::Gpt2Tokenizer;
 
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/smollm2");
     if !dir.join("model.safetensors").exists() {
@@ -137,8 +137,8 @@ fn prefill_matches_token_at_a_time() {
 /// Chunked prefill is the case that reads them.
 #[test]
 fn prefill_in_chunks_matches_a_single_pass() {
-    use kernrt::gpt2_tokenizer::Gpt2Tokenizer;
-    use kernrt::llama::Llama;
+    use kernrt::arch::llm::Llama;
+    use kernrt::tokenizer::Gpt2Tokenizer;
 
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/smollm2");
     if !dir.join("model.safetensors").exists() {

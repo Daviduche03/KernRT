@@ -61,6 +61,8 @@ Throughput falls in proportion to parameter count on every storage: decode is
 bandwidth-bound and stays that way at 2.7x the size, with no overhead creeping
 in. The ratios are stable too — bf16 to Q8_0 is 1.99x at both sizes (exactly
 the 2x that halving the bytes predicts), and Q8_0 to Q8_0x4 is 1.25x and 1.28x.
+The 1.7B extends this: bf16 decode is 11.0 against the 135M's 136, which is
+12.4x for 12.6x the parameters.
 
 Against llama.cpp on matched 200-token generation, interleaved:
 
@@ -69,9 +71,27 @@ Against llama.cpp on matched 200-token generation, interleaved:
 | 135M | 174-199 | 143-172 |
 | 360M | 71-95 (median ~89) | 79-84 (median ~81) |
 
-Both load with no code changes: the config parser and byte-level BPE were
-already generic, and the 360M's awkward `dim 960 / 15 heads / 5 KV heads`
-shape needed no special-casing.
+And on matched single-token decode (llama-bench `tg1`, which is what
+`examples/decode_rate.rs` measures), all three models, run back to back:
+
+| model | KernRT Q8_0x4 | llama.cpp Q8_0 CPU | ratio |
+|---|---|---|---|
+| 135M | 355 | 332 | 1.07x |
+| 360M | 140 | 135 | 1.04x |
+| 1.7B | 31.4 | 27.8 | 1.13x |
+
+Decode is ahead at every size and the margin widens slightly with it, which is
+the expected split: decode is a bandwidth problem and `Q8_0x4` moves half the
+bytes a Q8_0 row does. Note the two tables do not agree on the size of the
+margin — the 200-token numbers put 135M at 174-199 against 143-172, and `tg1`
+puts it at 355 against 332. Decode rate depends on context length, so a
+measurement of one is not a measurement of the other.
+
+All three load with no code changes: the config parser and byte-level BPE were
+already generic, and nothing needed special-casing for the 360M's
+`dim 960 / 15 heads / 5 KV heads` or the 1.7B's `2048 / 32 / 32`. The 1.7B is
+the first with `kv_mul == 1`, so its attention reads a distinct key per head
+where the other two share one across three and five heads respectively.
 
 Prefill (128-token prompt) on CPU, 4 threads, interleaved. llama.cpp is Q8_0
 GGUF; ours is the best storage for the job, which is `q8_0x4` on the decode
@@ -82,18 +102,40 @@ the quantized decode loop (see below).
 |---|---|---|---|---|
 | 135M | 274 (q8_0x4) | 218 (bf16) | 1207 | 4.4x |
 | 360M | 114 (q8_0x4) | 77 (bf16) | 512 | 4.5x |
+| 1.7B | 30 (q8_0x4) | 15 (bf16) | 124 | 4.1x |
 
 In GFLOP/s, which is what the kernel work should be judged on:
 
-| | 135M | 360M |
-|---|---|---|
-| llama.cpp | 326 | 371 |
-| ours, batched | 59 | 56 |
+| | 135M | 360M | 1.7B |
+|---|---|---|---|
+| llama.cpp | 326 | 371 | 424 |
+| ours, best (q8_0x4 loop) | 74 | 83 | 103 |
+| ours, batched (f32 GEMM) | 59 | 56 | 52 |
 
-llama.cpp's CPU prefill is faster in GFLOP/s at the larger model; ours is flat.
+llama.cpp's CPU prefill is faster in GFLOP/s at every size and gains with it.
+So does our quantized gemv, which is the interesting half: it is flat per token
+but the per-token cost amortizes better as the matrices grow, so the loop we
+routed the quantized storages *away* from is the thing that scales. The f32
+batched GEMM goes the other way, flat to slightly down.
+
+The ratio to llama.cpp is therefore roughly constant at 4.1-4.5x, and the
+kernel is the whole story — not model size. An earlier draft of this table said
+8.3x at 1.7B, which was measuring the batched path's collapse (below) rather
+than the gap we actually have to close.
+
 An earlier version of this file reported "492 single-thread, 1328 four-thread"
 without naming a model, and the two were crossed: 492 is the 360M four-thread
 number and 1328 is the 135M one (re-measured here as 512 and 1207).
+
+At 1.7B the f32-copy design stops paying for itself, and it is not the kernel
+that says so. `PrefillWeights` is 6.4 GB of f32 against 3.4 GB of bf16 weights
+and a 3.2 GB KV cache, on a 17 GB machine: the one-time copy took 18.5 s
+against the whole 128-token prefill's 8.6 s, with swap growing past 8 GB. The
+copy ends up larger than the thing it accelerates, and batching lands at 15
+tok/s against the 30 tok/s of simply looping the decode path. Anything at this
+size needs the batched path to read weights in their stored format instead of
+converting them, which is the same conclusion item 1 reaches from the other
+direction.
 
 ## The one bottleneck behind every remaining loss
 

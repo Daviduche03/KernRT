@@ -6,8 +6,8 @@ gets against mature libraries.
 
 ## What exists
 
-One model family (Llama-2 style: TinyStories and SmolLM2-135M), one device
-(CPU, NEON), one sequence at a time.
+One model family (Llama-2 style: TinyStories, SmolLM2-135M and SmolLM2-360M),
+one device (CPU, NEON), one sequence at a time.
 
 | piece | notes |
 |---|---|
@@ -20,7 +20,8 @@ One model family (Llama-2 style: TinyStories and SmolLM2-135M), one device
 | `gpt2_tokenizer.rs` | HuggingFace byte-level BPE (SmolLM2) |
 | `generate.rs` | greedy and temperature sampling |
 
-Three weight storages behind `Matrix`: f32, bf16, Q8_0.
+Four weight storages behind `Matrix`: f32, bf16, Q8_0, Q8_0x4 (four rows
+interleaved for lane-broadcast SDOT).
 
 ## Measured, single-thread M1
 
@@ -42,6 +43,36 @@ Decode, 200 tokens of generation:
 So we already beat everything except llama.cpp's Q8_0 CPU kernel (1.5x), and
 llama.cpp's F16 CPU path is degenerate (it widens weights per token).
 
+### Q8_0x4, and how it scales (SmolLM2-135M and 360M)
+
+`Q8_0x4` interleaves four output rows so one lane-broadcast SDOT updates four
+row sums from a single activation load, mirroring ggml's `block_q8_0x4`.
+
+Same harness, same metric, both models (single-thread M1):
+
+| storage | 135M | 360M | slowdown | params |
+|---|---|---|---|---|
+| f32 | 76.3 | 27.5 | 2.77x | 2.67x |
+| bf16 | 123.0 | 45.2 | 2.72x | 2.67x |
+| Q8_0 row | 245.4 | 89.8 | 2.73x | 2.67x |
+| **Q8_0x4** | **307.3** | **106.1** | 2.89x | 2.67x |
+
+Throughput falls in proportion to parameter count on every storage: decode is
+bandwidth-bound and stays that way at 2.7x the size, with no overhead creeping
+in. The ratios are stable too — bf16 to Q8_0 is 1.99x at both sizes (exactly
+the 2x that halving the bytes predicts), and Q8_0 to Q8_0x4 is 1.25x and 1.28x.
+
+Against llama.cpp on matched 200-token generation, interleaved:
+
+| model | KernRT Q8_0x4 | llama.cpp Q8_0 CPU |
+|---|---|---|
+| 135M | 174-199 | 143-172 |
+| 360M | 71-95 (median ~89) | 79-84 (median ~81) |
+
+Both load with no code changes: the config parser and byte-level BPE were
+already generic, and the 360M's awkward `dim 960 / 15 heads / 5 KV heads`
+shape needed no special-casing.
+
 Prefill (128-token prompt): llama.cpp Q8_0 is 492 tok/s single-thread and
 1328 with four threads. We do not have prefill yet; see below.
 
@@ -57,8 +88,9 @@ The micro-kernel. Evidence:
 * Decode is bandwidth-bound but still short of ceiling: Q8_0 moves 151 MB per
   token in ~5 ms, about 30 GB/s, where the machine streams 46 GB/s. A wider
   inner loop closes some of that too.
-* The 1.5x decode gap to llama.cpp is the same story: their `gemv_q8_0_4x4`
-  processes four rows per activation load, ours one.
+* The 1.5x decode gap to llama.cpp was the same story: their
+  `gemv_q8_0_4x4` processed four rows per activation load, ours one. Closed
+  by `Q8_0x4` below; decode is now ahead of their CPU path on both models.
 
 ## Plan, in order
 
@@ -121,6 +153,14 @@ kernel's row-at-a-time structure with the lane layout that llama.cpp uses.
   TinyStories (character-exact), mlx-lm f32 for SmolLM2 (3.9e-5, cosine
   1.00000000). Q8_0 matches the f32 greedy path for about 60 tokens before a
   near-tie flips, which is the honest accuracy of int8 here.
+* **Compare like statistics with like.** Claiming a 30% generation overhead
+  came from putting the *minimum* of 300 samples next to the *mean* of 200.
+  Median matched median showed no gap at all. The minimum is a noise floor,
+  not a typical value; only quote it against another minimum.
+* **Greedy divergence is chaos, not accuracy.** bf16 diverged from mlx-lm 4x
+  earlier than Q8_0x4 while having the *better* cosine, because whichever
+  side wins a near-tie picks an unrelated continuation. Rank fidelity by
+  cosine and first-token argmax, never by "tokens until the text differs".
 
 ## Known caveats
 

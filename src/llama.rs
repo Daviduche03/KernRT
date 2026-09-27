@@ -219,9 +219,12 @@ impl Llama {
         let dir = dir.as_ref();
         let (config, bf16) = parse_hf_config(&dir.join("config.json"))?;
         // Measurement aids, so one binary can A/B storage widths:
-        //   KERNRT_Q8_0=1     quantize the weights to int8 (Q8_0 blocks)
+        //   KERNRT_Q8_0=1     quantize the weights to int8 (row-major Q8_0)
+        //   KERNRT_Q8_0X4=1   four-row interleaved layout and lane-SDOT kernel
         //   KERNRT_ALL_F32=1  keep f32 instead of bf16
-        let storage = if std::env::var_os("KERNRT_Q8_0").is_some() {
+        let storage = if std::env::var_os("KERNRT_Q8_0X4").is_some() {
+            Storage::Q8_0x4
+        } else if std::env::var_os("KERNRT_Q8_0").is_some() {
             Storage::Q8_0
         } else if bf16 && std::env::var_os("KERNRT_ALL_F32").is_none() {
             Storage::Bf16
@@ -300,6 +303,7 @@ impl Llama {
             buf_mlp: vec![0.0; config.dim],
             q8: Q8Vec {
                 scales: Vec::new(),
+                scales_f16: Vec::new(),
                 quants: Vec::new(),
             },
             prefill: None,
@@ -476,7 +480,7 @@ fn project(w: &Matrix, q8: &mut Q8Vec, x: &[f32], y: &mut [f32]) {
 /// Run `w * x` using an activation already quantized by [`quantize_for`]. Call
 /// this for the second and later projection of a shared input.
 fn project_with(w: &Matrix, q8: &Q8Vec, x: &[f32], y: &mut [f32]) {
-    if matches!(w, Matrix::Q8_0 { .. }) {
+    if matches!(w, Matrix::Q8_0 { .. } | Matrix::Q8_0x4(_)) {
         gemv_q8_0_into(w, q8, y).expect("shapes are fixed at load");
     } else {
         gemv_into(w, x, y).expect("shapes are fixed at load");
@@ -485,7 +489,7 @@ fn project_with(w: &Matrix, q8: &Q8Vec, x: &[f32], y: &mut [f32]) {
 
 /// Quantize `x` for `w` when `w` is Q8_0; a no-op for wider storages.
 fn quantize_for(q8: &mut Q8Vec, w: &Matrix, x: &[f32]) {
-    if matches!(w, Matrix::Q8_0 { .. }) {
+    if matches!(w, Matrix::Q8_0 { .. } | Matrix::Q8_0x4(_)) {
         q8.quantize_into(x);
     }
 }
@@ -496,6 +500,7 @@ enum Storage {
     F32,
     Bf16,
     Q8_0,
+    Q8_0x4,
 }
 
 /// Take a raw tensor by name and widen it to f32. Used for the small tensors
@@ -560,6 +565,16 @@ fn matrix_from_raw(t: RawTensor, storage: Storage) -> Result<Matrix, LoadError> 
             let tensor = Tensor::from_vec(wide, &shape)?;
             Ok(Matrix::from_f32_q8_0(tensor).expect("row length is block-aligned"))
         }
+        (RawTensor::Bf16 { bits, .. }, Storage::Q8_0x4)
+            if shape[1] % Q8_0_BLOCK == 0 && shape[0] % crate::ops::Q8_0X4_ROWS == 0 =>
+        {
+            let wide: Vec<f32> = bits
+                .iter()
+                .map(|&b| f32::from_bits(u32::from(b) << 16))
+                .collect();
+            let tensor = Tensor::from_vec(wide, &shape)?;
+            Ok(Matrix::from_f32_q8_0x4(tensor).expect("shape is row and group aligned"))
+        }
         (raw, storage) => {
             let tensor = match raw {
                 RawTensor::F32(t) | RawTensor::F16(t) => t,
@@ -572,9 +587,14 @@ fn matrix_from_raw(t: RawTensor, storage: Storage) -> Result<Matrix, LoadError> 
             };
             match storage {
                 Storage::F32 => Ok(Matrix::from_f32(tensor)),
+                Storage::Q8_0x4
+                    if shape[1] % Q8_0_BLOCK == 0 && shape[0] % crate::ops::Q8_0X4_ROWS == 0 =>
+                {
+                    Ok(Matrix::from_f32_q8_0x4(tensor).expect("shape is row and group aligned"))
+                }
                 // A bf16 model asking for Q8_0 on a non-block-aligned row:
                 // narrowing keeps the bytes down rather than widening to f32.
-                Storage::Q8_0 | Storage::Bf16 => {
+                Storage::Q8_0 | Storage::Q8_0x4 | Storage::Bf16 => {
                     let bits: Vec<u16> = tensor
                         .data()
                         .iter()

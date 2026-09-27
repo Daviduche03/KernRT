@@ -96,7 +96,8 @@ fn bench_gemv(c: &mut Criterion) {
             .collect();
         let f32_matrix = Matrix::from_f32(w.clone());
         let bf16_matrix = Matrix::from_bf16_bits(bits, out_dim, in_dim);
-        let q8_matrix = Matrix::from_f32_q8_0(w).unwrap();
+        let q8_matrix = Matrix::from_f32_q8_0(w.clone()).unwrap();
+        let q8x4_matrix = Matrix::from_f32_q8_0x4(w).unwrap();
         group.bench_with_input(
             BenchmarkId::new("f32", format!("{out_dim}x{in_dim}")),
             &(out_dim, in_dim),
@@ -111,6 +112,11 @@ fn bench_gemv(c: &mut Criterion) {
             BenchmarkId::new("q8_0", format!("{out_dim}x{in_dim}")),
             &(out_dim, in_dim),
             |bench, _| bench.iter(|| gemv(black_box(&q8_matrix), black_box(x.data())).unwrap()),
+        );
+        group.bench_with_input(
+            BenchmarkId::new("q8_0x4", format!("{out_dim}x{in_dim}")),
+            &(out_dim, in_dim),
+            |bench, _| bench.iter(|| gemv(black_box(&q8x4_matrix), black_box(x.data())).unwrap()),
         );
     }
     group.finish();

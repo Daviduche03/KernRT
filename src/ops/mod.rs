@@ -24,7 +24,7 @@ pub use dense::{
 };
 pub(crate) use elementwise::softmax_in_place;
 pub use elementwise::{add_bias, relu, softmax};
-pub use quant::{Matrix, Q8_0_BLOCK, Q8Vec, gemv, gemv_into, gemv_q8_0_into};
+pub use quant::{Matrix, Q8_0_BLOCK, Q8_0X4_ROWS, Q8Vec, gemv, gemv_into, gemv_q8_0_into};
 
 #[allow(unused_imports)]
 pub(crate) use dot::{
@@ -496,6 +496,49 @@ mod tests {
         assert_eq!(matrix.in_dim(), 64);
         assert_eq!(matrix.row(0).len(), 64);
         assert!(matrix.row(1).iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn q8x4_repacked_rows_match_plain_q8_rows() {
+        for &(out_dim, in_dim) in &[(4usize, 32usize), (8, 64), (16, 128), (12, 96)] {
+            let w = random(&[out_dim, in_dim], 711);
+            let x = random(&[in_dim], 712);
+            let plain = gemv(&Matrix::from_f32_q8_0(w.clone()).unwrap(), x.data()).unwrap();
+            let packed = gemv(&Matrix::from_f32_q8_0x4(w).unwrap(), x.data()).unwrap();
+            for (row, (a, b)) in packed.data().iter().zip(plain.data()).enumerate() {
+                assert!(
+                    (a - b).abs() <= 5e-4 * (1.0 + b.abs()),
+                    "row {row}: q8x4 {a} vs row-wise {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn q8x4_rejects_unaligned_shapes() {
+        assert!(Matrix::from_f32_q8_0x4(t(vec![0.0; 6 * 32], &[6, 32])).is_none());
+        assert!(Matrix::from_f32_q8_0x4(t(vec![0.0; 8 * 30], &[8, 30])).is_none());
+        assert!(Matrix::from_f32_q8_0x4(t(vec![0.0; 8 * 32], &[8, 32])).is_some());
+    }
+
+    #[test]
+    fn q8x4_decodes_each_row_to_the_plain_quantization() {
+        let (out_dim, in_dim) = (8usize, 64usize);
+        let data: Vec<f32> = (0..out_dim * in_dim)
+            .map(|i| ((i * 17 % 251) as f32 - 125.0) / 137.0)
+            .collect();
+        let packed = Matrix::from_f32_q8_0x4(t(data.clone(), &[out_dim, in_dim])).unwrap();
+        let plain = Matrix::from_f32_q8_0(t(data, &[out_dim, in_dim])).unwrap();
+        for row in 0..out_dim {
+            let a = packed.row(row);
+            let b = plain.row(row);
+            for (lane, (x, y)) in a.iter().zip(&b).enumerate() {
+                assert!(
+                    (x - y).abs() <= 5e-4 * (1.0 + y.abs()),
+                    "row {row} lane {lane}: {x} vs {y}"
+                );
+            }
+        }
     }
 
     /// The NEON kernel and the scalar one must agree, including on lengths that

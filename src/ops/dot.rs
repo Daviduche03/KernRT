@@ -71,6 +71,34 @@ unsafe fn sdot(
     acc
 }
 
+/// `SDOT` with one 4-byte activation lane broadcast to all four dot lanes.
+/// Each 4-byte group of `a` is a different output row, which is the key to the
+/// four-row Q8_0 GEMV kernel: one activation lane updates four row sums.
+///
+/// SAFETY: `dotprod` must be available; `lane` is 0..=3.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(super) unsafe fn sdot_lane<const LANE: i32>(
+    acc: core::arch::aarch64::int32x4_t,
+    a: core::arch::aarch64::int8x16_t,
+    b: core::arch::aarch64::int8x16_t,
+) -> core::arch::aarch64::int32x4_t {
+    let mut acc = acc;
+    // SAFETY: the caller guarantees dotprod and the const generic is a valid
+    // lane index. The assembler checks that the immediate is in range.
+    unsafe {
+        core::arch::asm!(
+            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.4b[{lane}]",
+            acc = inout(vreg) acc,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            lane = const LANE,
+            options(pure, nomem, nostack)
+        );
+    }
+    acc
+}
+
 /// NEON Q8_0 dot product using SDOT, which sums four int8 products into each of
 /// four int32 lanes — sixteen multiply-adds per instruction. That is what makes
 /// int8 worth the bookkeeping: the kernel issues far fewer instructions than the

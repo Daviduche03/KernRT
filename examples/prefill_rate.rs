@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! cargo run --release --example prefill_rate -- 128
+//! VECLIB_MAXIMUM_THREADS=1 cargo run --release --example prefill_rate -- 128
 //! KERNRT_Q8_0X4=1 cargo run --release --example prefill_rate -- 128
 //! ```
 

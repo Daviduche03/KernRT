@@ -418,14 +418,10 @@ impl Llama {
         if n_tok == 0 {
             return &self.state.logits;
         }
-        // Gated on measured numbers, not on which kernel exists. Over 128
-        // tokens on SmolLM2-135M, interleaved, the batched f32 GEMM reaches
-        // about 218 tok/s against the decode loop's 87 (f32) and 124 (bf16),
-        // so those two gain. Q8_0 lands level (~220) and Q8_0x4 comes out
-        // ahead (~274): those gemv kernels decompress weights as they read
-        // them and already outrun a batched f32 product. PLAN item 3 is the
-        // batched quantized GEMM that would put all four on the fast path;
-        // until it exists, the quantized storages keep the loop.
+        // Q8 decode uses blockwise integer accumulation. Widening both inputs
+        // and weights for a batched f32 GEMM changes that accumulation enough
+        // to change logits across a deep model, so retain the exact Q8 path
+        // until it has a native batched Q8 kernel.
         if !matches!(self.storage(), "f32" | "bf16") {
             for (offset, &token) in tokens.iter().enumerate() {
                 self.forward(token, start + offset);

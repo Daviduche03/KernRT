@@ -253,10 +253,24 @@ pub fn matmul_packed_nt(a: &Tensor, w: &Tensor) -> Result<Tensor, TensorError> {
 /// # Panics
 ///
 /// Panics on a debug build if the slice lengths disagree with the shapes.
+#[allow(unreachable_code)] // macOS returns through Accelerate before the portable fallback.
 pub fn gemm_nt_into(lhs: &[f32], weights: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) {
     debug_assert_eq!(lhs.len(), m * k, "lhs must be m x k");
     debug_assert_eq!(weights.len(), n * k, "weights must be n x k");
     debug_assert_eq!(out.len(), m * n, "out must be m x n");
+
+    // Apple's BLAS routes these sizeable, dense projections to the CPU matrix
+    // unit, avoiding the cache and register scheduling guesses a portable
+    // compiler has to make. Set VECLIB_MAXIMUM_THREADS=1 for a strictly
+    // single-threaded benchmark. Other targets retain the self-contained
+    // packed kernel.
+    #[cfg(target_os = "macos")]
+    {
+        accelerate_sgemm_nt(lhs, weights, out, m, k, n);
+        return;
+    }
+
+    #[cfg(not(target_os = "macos"))]
     out.fill(0.0);
 
     let i_full = m - m % MR;
@@ -325,6 +339,68 @@ pub fn gemm_nt_into(lhs: &[f32], weights: &[f32], out: &mut [f32], m: usize, k: 
                 out[i * n + j] = acc;
             }
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "Accelerate", kind = "framework")]
+unsafe extern "C" {
+    fn cblas_sgemm(
+        order: i32,
+        trans_a: i32,
+        trans_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        b: *const f32,
+        ldb: i32,
+        beta: f32,
+        c: *mut f32,
+        ldc: i32,
+    );
+}
+
+/// BLAS `A[m, k] * W[n, k]^T` on macOS.
+#[cfg(target_os = "macos")]
+#[inline]
+fn accelerate_sgemm_nt(
+    lhs: &[f32],
+    weights: &[f32],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    // CBLAS integer sizes are signed 32-bit. A Rust Vec cannot approach this
+    // limit in the supported configurations, but make the boundary explicit
+    // rather than silently truncating an unusually large tensor.
+    let (m, k, n) = (
+        i32::try_from(m).expect("matrix row count exceeds CBLAS range"),
+        i32::try_from(k).expect("matrix column count exceeds CBLAS range"),
+        i32::try_from(n).expect("matrix output count exceeds CBLAS range"),
+    );
+    // SAFETY: slice lengths are asserted by the public caller. The CBLAS row
+    // major dimensions below describe exactly those contiguous slices.
+    unsafe {
+        cblas_sgemm(
+            101, // CblasRowMajor
+            111, // CblasNoTrans
+            112, // CblasTrans
+            m,
+            n,
+            k,
+            1.0,
+            lhs.as_ptr(),
+            k,
+            weights.as_ptr(),
+            k,
+            0.0,
+            out.as_mut_ptr(),
+            n,
+        );
     }
 }
 

@@ -123,6 +123,15 @@ impl Tensor {
         &mut self.data
     }
 
+    /// Drop the shape and hand over the elements.
+    ///
+    /// For conversions that produce a buffer with a shape already known to the
+    /// caller — extracting an f32 weight copy, for instance — this avoids
+    /// allocating a second time to move the data out.
+    pub fn into_data(self) -> Vec<f32> {
+        self.data
+    }
+
     /// Translate a multi-dimensional index into a flat row-major offset.
     fn flat_index(&self, index: &[usize]) -> Result<usize, TensorError> {
         if index.len() != self.rank() {

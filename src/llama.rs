@@ -8,7 +8,9 @@
 //! the state buffers in place.
 
 use crate::llama2c::{Checkpoint, LayerWeights, Llama2cError};
-use crate::ops::{Matrix, Q8_0_BLOCK, Q8Vec, dot, gemv_into, gemv_q8_0_into, softmax_in_place};
+use crate::ops::{
+    Matrix, Q8_0_BLOCK, Q8Vec, dot, gemm_nt_into, gemv_into, gemv_q8_0_into, softmax_in_place,
+};
 use crate::safetensors::{self, RawTensor, SafeTensorsError};
 use crate::tensor::Tensor;
 use std::collections::HashMap;
@@ -133,17 +135,20 @@ struct State {
     /// Scratch for the quantized form of the current activation (Q8_0 only).
     q8: Q8Vec,
     /// Batched scratch, sized on first use because the prompt length is only
-    /// known then. Not yet read: see `PrefillBuffers`.
-    #[allow(dead_code)]
+    /// known then.
     prefill: Option<PrefillBuffers>,
+    /// f32 copies of every projection, built once on first prefill. Built
+    /// lazily because most runs decode one token at a time and never pay for
+    /// them, and kept beside `prefill` so a single `&mut self.state` borrow
+    /// covers both while the layers are read through a separate immutable one.
+    prefill_weights: Option<PrefillWeights>,
 }
 
 /// Row-major `[n_tok, width]` scratch for a batched forward pass.
 ///
-/// Allocated but not yet consumed: the batched path is being built behind the
-/// equality test in `tests/end_to_end.rs`, and `prefill` still runs the decode
-/// loop. The `allow` goes away with that implementation.
-#[allow(dead_code)]
+/// Sized on the first prompt and reused until a longer one arrives. The decode
+/// loop keeps its own buffers in [`State`], so filling these cannot disturb a
+/// decode run.
 struct PrefillBuffers {
     /// Rows the buffers were sized for; requests up to this length reuse them.
     n_tok: usize,
@@ -163,8 +168,79 @@ struct PrefillBuffers {
     gate: Vec<f32>,
     /// `[n_tok, hidden_dim]` up projection.
     up: Vec<f32>,
-    /// `[n_tok, n_heads, seq_len]` attention scores.
+    /// `[n_heads, seq_len]` attention scores for the row being processed.
     att: Vec<f32>,
+}
+
+/// f32 copies of one layer's projections, for the batched GEMMs.
+///
+/// Prefill only ever runs on short prompts, and a prompt's activations are far
+/// too small to matter on their own — what matters is that each of the seven
+/// projections reads its weights once instead of once per token. Converting
+/// to f32 also means one kernel serves every storage the model was loaded at,
+/// so the batched path does not grow a second copy of itself per storage.
+struct PrefillLayer {
+    wq: Vec<f32>,
+    wk: Vec<f32>,
+    wv: Vec<f32>,
+    wo: Vec<f32>,
+    w1: Vec<f32>,
+    w2: Vec<f32>,
+    w3: Vec<f32>,
+}
+
+/// The f32 projection copies for every layer, built once on first prefill.
+///
+/// The shapes are not repeated here: every call site already holds a
+/// [`Config`], and one copy of the truth is less to keep in sync than two.
+struct PrefillWeights {
+    layers: Vec<PrefillLayer>,
+}
+
+impl PrefillBuffers {
+    /// Scratch for `n_tok` rows at the given model shape.
+    fn new(n_tok: usize, config: &Config) -> Self {
+        let dim = config.dim;
+        let kv_dim = config.kv_dim();
+        let hidden = config.hidden_dim;
+        Self {
+            n_tok,
+            x: vec![0.0; n_tok * dim],
+            xb: vec![0.0; n_tok * dim],
+            q: vec![0.0; n_tok * dim],
+            k: vec![0.0; n_tok * kv_dim],
+            v: vec![0.0; n_tok * kv_dim],
+            o: vec![0.0; n_tok * dim],
+            gate: vec![0.0; n_tok * hidden],
+            up: vec![0.0; n_tok * hidden],
+            att: vec![0.0; config.n_heads * config.seq_len],
+        }
+    }
+}
+
+impl PrefillWeights {
+    /// Copy every projection of every layer to f32.
+    ///
+    /// One conversion per weight for the whole session, not one per layer per
+    /// prompt: the batched GEMM reads each matrix as a contiguous `[out, in]`
+    /// f32 block, which works regardless of which storage it came from.
+    fn build(layers: &[LayerWeights]) -> Self {
+        let copy = |w: &Matrix| w.to_f32_tensor().into_data();
+        Self {
+            layers: layers
+                .iter()
+                .map(|layer| PrefillLayer {
+                    wq: copy(&layer.wq),
+                    wk: copy(&layer.wk),
+                    wv: copy(&layer.wv),
+                    wo: copy(&layer.wo),
+                    w1: copy(&layer.w1),
+                    w2: copy(&layer.w2),
+                    w3: copy(&layer.w3),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// A loaded transformer.
@@ -307,6 +383,7 @@ impl Llama {
                 quants: Vec::new(),
             },
             prefill: None,
+            prefill_weights: None,
         };
         Llama {
             config,
@@ -341,13 +418,185 @@ impl Llama {
         if n_tok == 0 {
             return &self.state.logits;
         }
-        // Until the batched path is in, the honest fallback is the decode loop.
-        // It is correct by construction, so the equality test below has a
-        // reference to compare against from the start.
-        for (offset, &token) in tokens.iter().enumerate() {
-            self.forward(token, start + offset);
+        // Gated on measured numbers, not on which kernel exists. Over 128
+        // tokens on SmolLM2-135M, interleaved, the batched f32 GEMM reaches
+        // about 218 tok/s against the decode loop's 87 (f32) and 124 (bf16),
+        // so those two gain. Q8_0 lands level (~220) and Q8_0x4 comes out
+        // ahead (~274): those gemv kernels decompress weights as they read
+        // them and already outrun a batched f32 product. PLAN item 3 is the
+        // batched quantized GEMM that would put all four on the fast path;
+        // until it exists, the quantized storages keep the loop.
+        if !matches!(self.storage(), "f32" | "bf16") {
+            for (offset, &token) in tokens.iter().enumerate() {
+                self.forward(token, start + offset);
+            }
+            return &self.state.logits;
         }
+        self.prefill_batched(tokens, start);
         &self.state.logits
+    }
+
+    /// One batched forward over a whole prompt.
+    ///
+    /// The same arithmetic as [`forward`](Self::forward) stepped token by
+    /// token, except that each projection multiplies every row at once instead
+    /// of one row at a time, so each weight matrix is read once rather than
+    /// once per token. Attention stays per row: its scores are causal, so row
+    /// `i` attends to `start..=start + i` and there is nothing to batch.
+    fn prefill_batched(&mut self, tokens: &[usize], start: usize) {
+        let config = self.config;
+        let n_tok = tokens.len();
+        let dim = config.dim;
+        let hidden = config.hidden_dim;
+        let kv_dim = config.kv_dim();
+        let head_size = config.head_size();
+        let seq_len = config.seq_len;
+
+        let token_embedding = &self.token_embedding;
+        let rms_final = &self.rms_final;
+        let classifier = self.wcls.as_ref().unwrap_or(&self.token_embedding);
+        let layers = &self.layers;
+        let state = &mut self.state;
+
+        if state.prefill_weights.is_none() {
+            state.prefill_weights = Some(PrefillWeights::build(layers));
+        }
+        if state.prefill.as_ref().is_none_or(|p| p.n_tok < n_tok) {
+            state.prefill = Some(PrefillBuffers::new(n_tok, &config));
+        }
+        let weights = state.prefill_weights.as_ref().expect("built above");
+        let pf = state.prefill.as_mut().expect("built above");
+        // Split out so attention can take this row's query and that row's
+        // output at the same time, which a second borrow of `pf` would not
+        // allow.
+        let PrefillBuffers {
+            x,
+            xb,
+            q,
+            k,
+            v,
+            o,
+            gate,
+            up,
+            att,
+            ..
+        } = pf;
+
+        for (row, &token) in tokens.iter().enumerate() {
+            let embedding = token_embedding.row(token);
+            x[row * dim..(row + 1) * dim].copy_from_slice(&embedding);
+        }
+
+        for (l, layer) in layers.iter().take(config.n_layers).enumerate() {
+            let w = &weights.layers[l];
+            let loff = l * seq_len * kv_dim;
+
+            // Attention RMSNorm, one row at a time: it is element-wise, so
+            // there is no product to batch and nothing to gain from stacking
+            // the rows.
+            for row in 0..n_tok {
+                let at = row * dim;
+                rms_norm(
+                    &mut xb[at..at + dim],
+                    &x[at..at + dim],
+                    layer.rms_att.data(),
+                    config.rms_eps,
+                );
+            }
+
+            gemm_nt_into(xb, &w.wq, q, n_tok, dim, dim);
+            gemm_nt_into(xb, &w.wk, k, n_tok, dim, kv_dim);
+            gemm_nt_into(xb, &w.wv, v, n_tok, dim, kv_dim);
+
+            // RoPE rotates q and k before k is cached, matching both
+            // references, so it runs over the batched rows before any row
+            // reads the cache.
+            for row in 0..n_tok {
+                let pos = start + row;
+                let qr = row * dim;
+                let kr = row * kv_dim;
+                if config.rope_interleaved {
+                    rope_interleaved(
+                        &mut q[qr..qr + dim],
+                        &mut k[kr..kr + kv_dim],
+                        pos,
+                        head_size,
+                        kv_dim,
+                        config.rope_theta,
+                    );
+                } else {
+                    rope_half(&mut q[qr..qr + dim], pos, head_size, config.rope_theta);
+                    rope_half(&mut k[kr..kr + kv_dim], pos, head_size, config.rope_theta);
+                }
+                let slot = loff + pos * kv_dim;
+                state.key_cache[slot..slot + kv_dim].copy_from_slice(&k[kr..kr + kv_dim]);
+                state.value_cache[slot..slot + kv_dim].copy_from_slice(&v[kr..kr + kv_dim]);
+            }
+
+            // Causal, so row `row` sees positions up to `start + row` and the
+            // rows do not interact. The score buffer is reused: only one row
+            // is in flight at a time.
+            for row in 0..n_tok {
+                let pos = start + row;
+                let qr = row * dim;
+                attention(
+                    AttentionInput {
+                        q: &q[qr..qr + dim],
+                        key_cache: &state.key_cache,
+                        value_cache: &state.value_cache,
+                    },
+                    att,
+                    &mut xb[qr..qr + dim],
+                    loff,
+                    pos,
+                    &config,
+                );
+            }
+
+            gemm_nt_into(xb, &w.wo, o, n_tok, dim, dim);
+            for (residual, &add) in x.iter_mut().zip(o.iter()) {
+                *residual += add;
+            }
+
+            // Feed-forward RMSNorm, then the gated MLP.
+            for row in 0..n_tok {
+                let at = row * dim;
+                rms_norm(
+                    &mut xb[at..at + dim],
+                    &x[at..at + dim],
+                    layer.rms_ffn.data(),
+                    config.rms_eps,
+                );
+            }
+            gemm_nt_into(xb, &w.w1, gate, n_tok, dim, hidden);
+            gemm_nt_into(xb, &w.w3, up, n_tok, dim, hidden);
+            for (g, &u) in gate.iter_mut().zip(up.iter()) {
+                *g = silu(*g) * u;
+            }
+            gemm_nt_into(gate, &w.w2, o, n_tok, hidden, dim);
+            for (residual, &add) in x.iter_mut().zip(o.iter()) {
+                *residual += add;
+            }
+        }
+
+        // Only the logits after the final prompt token are wanted, so the
+        // classifier runs on that one row through the ordinary path. Sending
+        // all `n_tok` rows through it would compute 128 copies of the result
+        // and hand 127 away, and this way it stays a matvec instead of a
+        // matrix product.
+        let last = (n_tok - 1) * dim;
+        rms_norm(
+            &mut xb[last..last + dim],
+            &x[last..last + dim],
+            rms_final.data(),
+            config.rms_eps,
+        );
+        project(
+            classifier,
+            &mut state.q8,
+            &xb[last..last + dim],
+            &mut state.logits,
+        );
     }
 
     /// The storage width the weights were loaded at.

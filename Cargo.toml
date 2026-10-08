@@ -31,6 +31,11 @@ serve = [
     "dep:reqwest",
 ]
 
+# `serve` imports `kernrt::serve`, which only exists under the feature.
+[[example]]
+name = "serve"
+required-features = ["serve"]
+
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 # Lets the serve integration tests drive the router in-process (oneshot)

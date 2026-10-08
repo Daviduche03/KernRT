@@ -1,0 +1,19 @@
+{
+  "models": [
+    { "id": "yolo26n", "kind": "detect", "path": "yolo26n.onnx", "width": 640, "height": 640 },
+    { "id": "jev", "kind": "decide", "path": "target/nanojev", "seq_len": 2048 },
+    {
+      "id": "smollm2",
+      "kind": "generate",
+      "path": "target/smollm2",
+      "chat_template": {
+        "message": {
+          "system": "System: {content}\n\n",
+          "user": "User: {content}\n",
+          "assistant": "Assistant: {content}\n"
+        },
+        "generation_prompt": "Assistant:"
+      }
+    }
+  ]
+}

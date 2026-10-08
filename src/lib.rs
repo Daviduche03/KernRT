@@ -9,5 +9,7 @@ pub mod arch;
 pub mod formats;
 pub mod generate;
 pub mod ops;
+#[cfg(feature = "serve")]
+pub mod serve;
 pub mod tensor;
 pub mod tokenizer;

@@ -8,7 +8,7 @@
 //! ```
 
 use kernrt::arch::llm::Llama;
-use kernrt::tokenizer::Gpt2Tokenizer;
+use kernrt::tokenizer::BpeTokenizer;
 use std::error::Error;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or(128);
 
     let mut model = Llama::from_hf(&dir)?;
-    let tokenizer = Gpt2Tokenizer::load(dir.join("tokenizer.json"))?;
+    let tokenizer = BpeTokenizer::load(dir.join("tokenizer.json"))?;
 
     // Build a prompt of exactly `n` tokens by repeating a sentence, so the
     // prompt is real text rather than token ids the model never sees.

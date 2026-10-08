@@ -6,7 +6,7 @@
 //! ```
 
 use kernrt::arch::llm::Llama;
-use kernrt::tokenizer::Gpt2Tokenizer;
+use kernrt::tokenizer::BpeTokenizer;
 use std::error::Error;
 use std::hint::black_box;
 use std::path::PathBuf;
@@ -15,7 +15,7 @@ use std::time::Instant;
 fn main() -> Result<(), Box<dyn Error>> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/smollm2");
     let mut model = Llama::from_hf(&dir)?;
-    let tokenizer = Gpt2Tokenizer::load(dir.join("tokenizer.json"))?;
+    let tokenizer = BpeTokenizer::load(dir.join("tokenizer.json"))?;
     let token = tokenizer.encode("The", false)[0];
 
     for _ in 0..5 {

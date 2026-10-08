@@ -12,7 +12,7 @@
 
 use kernrt::arch::llm::Llama;
 use kernrt::generate::Sampler;
-use kernrt::tokenizer::Gpt2Tokenizer;
+use kernrt::tokenizer::BpeTokenizer;
 use std::error::Error;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let seed: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(42);
 
     let mut model = Llama::from_hf(&dir)?;
-    let tokenizer = Gpt2Tokenizer::load(dir.join("tokenizer.json"))?;
+    let tokenizer = BpeTokenizer::load(dir.join("tokenizer.json"))?;
     println!(
         "storage {} | vocab {} | prompt {prompt:?} | temp {temperature}",
         model.storage(),
@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// number of tokens sampled.
 fn run_generation(
     model: &mut Llama,
-    tokenizer: &Gpt2Tokenizer,
+    tokenizer: &BpeTokenizer,
     sampler: &mut Sampler,
     prompt_tokens: &[usize],
     steps: usize,

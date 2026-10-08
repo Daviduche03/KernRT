@@ -1,7 +1,9 @@
 //! Autoregressive language models: a token in, logits for the next out.
 
+pub mod hf;
 pub mod llama;
 
+pub use hf::LoadError;
 pub use llama::Llama;
 
 /// What the generation loop needs from a decoder.

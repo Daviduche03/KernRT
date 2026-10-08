@@ -56,14 +56,14 @@ fn missing_file_is_an_io_error() {
 #[test]
 fn prefill_matches_token_at_a_time() {
     use kernrt::arch::llm::Llama;
-    use kernrt::tokenizer::Gpt2Tokenizer;
+    use kernrt::tokenizer::BpeTokenizer;
 
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/smollm2");
     if !dir.join("model.safetensors").exists() {
         eprintln!("skipping: no SmolLM2 fixture in target/smollm2");
         return;
     }
-    let tokenizer = Gpt2Tokenizer::load(dir.join("tokenizer.json")).unwrap();
+    let tokenizer = BpeTokenizer::load(dir.join("tokenizer.json")).unwrap();
     // Long enough that the rows have a real causal chain behind them: row `i`
     // attends over `0..=i`, so a five-token prompt never reaches a row with
     // anything but trivial history. Kept at 24 because the unoptimized test
@@ -138,14 +138,14 @@ fn prefill_matches_token_at_a_time() {
 #[test]
 fn prefill_in_chunks_matches_a_single_pass() {
     use kernrt::arch::llm::Llama;
-    use kernrt::tokenizer::Gpt2Tokenizer;
+    use kernrt::tokenizer::BpeTokenizer;
 
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/smollm2");
     if !dir.join("model.safetensors").exists() {
         eprintln!("skipping: no SmolLM2 fixture in target/smollm2");
         return;
     }
-    let tokenizer = Gpt2Tokenizer::load(dir.join("tokenizer.json")).unwrap();
+    let tokenizer = BpeTokenizer::load(dir.join("tokenizer.json")).unwrap();
     let seed = "The capital of France is Paris, a city known for its art and food. ";
     let mut prompt = Vec::new();
     while prompt.len() < 12 {
@@ -193,4 +193,110 @@ fn prefill_in_chunks_matches_a_single_pass() {
         max_diff <= 1e-3,
         "decode after chunked prefill disagrees by {max_diff}"
     );
+}
+
+/// Independent sequences scored in one batched forward must produce exactly
+/// what each would produce alone: the per-sequence cache offset and attention
+/// mask must keep them from seeing one another.
+#[test]
+fn prefill_multi_isolates_sequences_from_each_other() {
+    use kernrt::arch::llm::Llama;
+    use kernrt::tokenizer::BpeTokenizer;
+
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/smollm2");
+    if !dir.join("model.safetensors").exists() {
+        eprintln!("skipping: no SmolLM2 fixture in target/smollm2");
+        return;
+    }
+    let tokenizer = BpeTokenizer::load(dir.join("tokenizer.json")).unwrap();
+    let encode = |s: &str| tokenizer.encode(s, false);
+
+    let a = encode("The capital of France is");
+    let b = encode(" A completely different and much longer sentence to score. ");
+    let c = encode("Uno");
+    assert!(a.len() > 1 && b.len() > 1 && c.len() > 1);
+
+    let mut model = Llama::from_hf(&dir).unwrap();
+    let alone_a = model.prefill_multi(&[&a])[0].clone();
+    let alone_b = model.prefill_multi(&[&b])[0].clone();
+    let alone_c = model.prefill_multi(&[&c])[0].clone();
+
+    // Order and neighbours must not matter.
+    let batch = Llama::from_hf(&dir).unwrap().prefill_multi(&[&c, &a, &b]);
+    let max = |x: &[f32], y: &[f32]| {
+        x.iter()
+            .zip(y)
+            .map(|(p, q)| (p - q).abs())
+            .fold(0.0f32, f32::max)
+    };
+    assert!(
+        max(&batch[0], &alone_c) <= 1e-4,
+        "first sequence changed when batched: {}",
+        max(&batch[0], &alone_c)
+    );
+    assert!(
+        max(&batch[1], &alone_a) <= 1e-4,
+        "middle sequence changed when batched: {}",
+        max(&batch[1], &alone_a)
+    );
+    assert!(
+        max(&batch[2], &alone_b) <= 1e-4,
+        "last sequence changed when batched: {}",
+        max(&batch[2], &alone_b)
+    );
+}
+
+#[test]
+fn prefill_shared_matches_repeating_the_prefix() {
+    use kernrt::arch::llm::Llama;
+    use kernrt::tokenizer::BpeTokenizer;
+
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/smollm2");
+    if !dir.join("model.safetensors").exists() {
+        eprintln!("skipping: no SmolLM2 fixture in target/smollm2");
+        return;
+    }
+    let tokenizer = BpeTokenizer::load(dir.join("tokenizer.json")).unwrap();
+    let encode = |s: &str| tokenizer.encode(s, false);
+
+    // Suffixes of deliberately different lengths, so a row's own range and the
+    // shared range must stay distinct for every leaf.
+    let prefix = encode("The capital of France is");
+    let suffixes: Vec<Vec<usize>> = [
+        " Paris.",
+        " a very different and much longer continuation of this leaf, to stretch the window.",
+        "!",
+    ]
+    .iter()
+    .map(|s| encode(s))
+    .collect();
+    assert!(prefix.len() > 1 && suffixes.iter().all(|s| !s.is_empty()));
+
+    // The same leaves, with the prefix spelled out in each one.
+    let leaves: Vec<Vec<usize>> = suffixes
+        .iter()
+        .map(|suffix| prefix.iter().chain(suffix).copied().collect())
+        .collect();
+    let leaf_refs: Vec<&[usize]> = leaves.iter().map(Vec::as_slice).collect();
+    let suffix_refs: Vec<&[usize]> = suffixes.iter().map(Vec::as_slice).collect();
+
+    let shared = Llama::from_hf(&dir)
+        .unwrap()
+        .prefill_shared(&prefix, &suffix_refs);
+    let repeated = Llama::from_hf(&dir).unwrap().prefill_multi(&leaf_refs);
+
+    assert_eq!(shared.len(), repeated.len());
+    let max = |x: &[f32], y: &[f32]| {
+        x.iter()
+            .zip(y)
+            .map(|(p, q)| (p - q).abs())
+            .fold(0.0f32, f32::max)
+    };
+    for (i, (got, want)) in shared.iter().zip(&repeated).enumerate() {
+        assert!(
+            max(got, want) <= 1e-4,
+            "leaf {i} changed when the prefix was shared: {}",
+            max(got, want)
+        );
+    }
 }

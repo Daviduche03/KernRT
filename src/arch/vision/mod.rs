@@ -1,6 +1,8 @@
 //! Single-shot image models: an image in, a prediction out.
 //!
-//! Only the dense classifier lives here today; conv nets and vision
-//! transformers would join it.
+//! The dense classifier, the YOLO26 detector, and the opt-in profiler the
+//! detector keeps out of its own file ([`bench`]).
 
+pub(crate) mod bench;
 pub mod mlp;
+pub mod yolo26;

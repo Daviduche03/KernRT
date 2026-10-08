@@ -4,5 +4,6 @@
 //! [`crate::formats`]. `llm` holds the autoregressive decoders; `vision` holds
 //! the single-shot image models.
 
+pub mod decision;
 pub mod llm;
 pub mod vision;

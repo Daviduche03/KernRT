@@ -1,4 +1,7 @@
 /target
+/yolo26*.pt
+/yolo26*.onnx
+__pycache__/
 
 # Machine-specific toolchain workaround: hardcodes an Xcode SDK path.
 # See the comment inside for why it exists and when to delete it.

@@ -20,8 +20,8 @@ mod elementwise;
 mod quant;
 
 pub use dense::{
-    gemm_nt_into, matmul, matmul_neon, matmul_packed, matmul_packed_nt, matmul_tiled, matvec,
-    transpose,
+    gemm_nn_into, gemm_nt_into, matmul, matmul_neon, matmul_packed, matmul_packed_nt, matmul_tiled,
+    matvec, transpose,
 };
 pub(crate) use elementwise::softmax_in_place;
 pub use elementwise::{add_bias, relu, softmax};
@@ -206,6 +206,120 @@ mod tests {
         }
         let got = Tensor::from_vec(out, &[16, 24]).unwrap();
         assert_close(&got, &want, "repeated calls");
+    }
+
+    /// The plain NoTrans GEMM must agree with the reference, on the shapes the
+    /// convolution path uses as well as the degenerate ones.
+    #[test]
+    fn gemm_nn_into_matches_matmul() {
+        for (m, k, n) in [
+            (1usize, 1usize, 1usize),
+            (3, 5, 7),
+            (8, 8, 8),
+            (17, 19, 23),
+            (64, 64, 64),
+            (65, 257, 513),
+            (6400, 576, 64),
+            (80, 27, 16),
+        ] {
+            let a = random(&[m, k], 31);
+            let b = random(&[k, n], 32);
+            let want = matmul(&a, &b).unwrap();
+            let mut out = vec![7.5f32; m * n];
+            gemm_nn_into(a.data(), b.data(), &mut out, n, m, k, n);
+            let got = Tensor::from_vec(out, &[m, n]).unwrap();
+            assert_close(&got, &want, &format!("gemm_nn_into {m}x{k}x{n}"));
+        }
+    }
+
+    /// The rate the convolution path actually gets out of the NoTrans GEMM,
+    /// on the shapes it issues rather than on a square test matrix: `a` is the
+    /// weights `[filters, reduction]`, `b` is the im2col panel
+    /// `[reduction, columns]`, and the result lands at `out_ld = output_h *
+    /// output_w` so only one row band of it is live. Prints because the rate
+    /// is the point; the floor is loose so a loaded machine does not turn a
+    /// measurement into a failure.
+    // A measurement, not a correctness check: it prints rates, and a loaded
+    // machine turns its floor into a spurious failure. Run it on demand with
+    // `cargo test --release gemm_nn_into_reaches -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "rate measurement; needs an idle machine"]
+    fn gemm_nn_into_reaches_a_usable_rate_on_conv_shapes() {
+        // (filters, reduction, columns, output spatial) for one band of each
+        // convolution class in yolo26n.
+        for (m, k, n, ld) in [
+            (16usize, 27usize, 19_200usize, 102_400usize),
+            (32, 144, 12_800, 25_600),
+            (64, 576, 6_400, 6_400),
+            (128, 1_152, 1_600, 1_600),
+            (16, 16, 102_400, 102_400),
+            (256, 256, 6_400, 6_400),
+            (128, 128, 1_600, 1_600),
+        ] {
+            let a = random(&[m, k], 41);
+            let b = random(&[k, n], 42);
+            let mut out = vec![0.0f32; m * ld];
+            gemm_nn_into(a.data(), b.data(), &mut out, ld, m, k, n);
+            let reps = (2_000_000_000usize / (m * k * n)).clamp(10, 500);
+            let start = std::time::Instant::now();
+            for _ in 0..reps {
+                gemm_nn_into(a.data(), b.data(), &mut out, ld, m, k, n);
+            }
+            let secs = start.elapsed().as_secs_f64() / reps as f64;
+            let gflops = 2.0 * (m * k * n) as f64 / secs / 1e9;
+            println!("gemm {m:4}x{k:5}x{n:7} ld={ld:7}: {gflops:6.0} GFLOPS");
+            // Loose: this is a measurement with a smoke-test floor, not a
+            // target. The numbers are read from the output.
+            assert!(gflops > 50.0, "{m}x{k}x{n} only reached {gflops:.0} GFLOPS");
+        }
+    }
+
+    /// Like the `nt` variant, a dirty output buffer must not leak between calls.
+    #[test]
+    fn gemm_nn_into_overwrites_previous_results() {
+        let a = random(&[16, 32], 5);
+        let b = random(&[32, 24], 6);
+        let want = matmul(&a, &b).unwrap();
+
+        let mut out = vec![0.0f32; 16 * 24];
+        for _ in 0..3 {
+            gemm_nn_into(a.data(), b.data(), &mut out, 24, 16, 32, 24);
+        }
+        let got = Tensor::from_vec(out, &[16, 24]).unwrap();
+        assert_close(&got, &want, "repeated calls");
+    }
+
+    /// The strided form writes one column range of a wider matrix, which is
+    /// how the convolution tiles its output. It must match a single multiply
+    /// over the whole matrix and leave the guard columns alone.
+    #[test]
+    fn gemm_nn_into_lands_in_the_right_column_range() {
+        let (m, k, n) = (17usize, 23usize, 65usize);
+        let a = random(&[m, k], 33);
+        let b = random(&[k, n], 34);
+        let want = matmul(&a, &b).unwrap();
+        let want = want.data();
+
+        let ld = n + 5;
+        let guard = 9.25f32;
+        let mut wide = vec![guard; m * ld];
+        // The submatrix starts at column 1 of every row, so both the leading
+        // guard column and the trailing ones have to come back untouched.
+        gemm_nn_into(a.data(), b.data(), &mut wide[1..], ld, m, k, n);
+        for i in 0..m {
+            assert_eq!(wide[i * ld], guard, "leading guard column, row {i}");
+            for j in n + 1..ld {
+                assert_eq!(wide[i * ld + j], guard, "trailing guard {j}, row {i}");
+            }
+            for j in 0..n {
+                let got = wide[i * ld + 1 + j];
+                let expected = want[i * n + j];
+                assert!(
+                    (got - expected).abs() <= 1e-4 + 1e-4 * expected.abs(),
+                    "row {i} col {j}: got {got}, want {expected}"
+                );
+            }
+        }
     }
 
     /// The packed GEMM must agree with the reference on the same shape grid,

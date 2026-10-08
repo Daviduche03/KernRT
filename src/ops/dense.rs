@@ -404,6 +404,155 @@ fn accelerate_sgemm_nt(
     }
 }
 
+/// Plain row-major GEMM: `out[i * out_ld + j] = sum_p a[i, p] * b[p, j]`.
+///
+/// The vision path needs exactly this shape, and [`gemm_nt_into`] cannot
+/// express it without transposing something. Building the im2col panel as
+/// `[k, rows]` — the layout OIHW weights already have — makes both operands
+/// NoTrans, so the large matrix is packed with contiguous reads and `out`
+/// comes back in NCHW order with no second transpose pass.
+///
+/// `a` and `b` are exactly `m x k` and `k x n`. `out` may be a submatrix of a
+/// wider one: it covers `m` rows of `n` values each, spaced `out_ld` apart.
+/// That is how a row-tiled convolution writes its column range of the NCHW
+/// output — BLAS takes the stride natively, so no scatter pass is needed.
+///
+/// `out` is overwritten, not accumulated.
+#[allow(unreachable_code)] // macOS returns through Accelerate before the portable fallback.
+pub fn gemm_nn_into(
+    a: &[f32],
+    b: &[f32],
+    out: &mut [f32],
+    out_ld: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    debug_assert_eq!(a.len(), m * k, "a must be m x k");
+    debug_assert_eq!(b.len(), k * n, "b must be k x n");
+    debug_assert!(
+        out.len() >= m.saturating_sub(1) * out_ld + n,
+        "out is not large enough for its leading dimension"
+    );
+
+    #[cfg(target_os = "macos")]
+    {
+        accelerate_sgemm_nn(a, b, out, out_ld, m, k, n);
+        return;
+    }
+
+    // `packed_micro` accumulates, so the destination has to start at zero.
+    #[cfg(not(target_os = "macos"))]
+    for i in 0..m {
+        out[i * out_ld..i * out_ld + n].fill(0.0);
+    }
+
+    let i_full = m - m % MR;
+    let j_full = n - n % NR;
+
+    if i_full == 0 || j_full == 0 {
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    acc = a[i * k + p].mul_add(b[p * n + j], acc);
+                }
+                out[i * out_ld + j] = acc;
+            }
+        }
+        return;
+    }
+
+    let mut a_panel = vec![0.0f32; GEMM_MC * GEMM_KC];
+    let mut b_panel = vec![0.0f32; GEMM_KC * GEMM_NC];
+
+    for i0 in (0..i_full).step_by(GEMM_MC) {
+        let mc = GEMM_MC.min(i_full - i0);
+        for j0 in (0..j_full).step_by(GEMM_NC) {
+            let nc = GEMM_NC.min(j_full - j0);
+            for p0 in (0..k).step_by(GEMM_KC) {
+                let kc = GEMM_KC.min(k - p0);
+                // Both operands are NoTrans, so neither pack needs a transpose:
+                // every row here is a contiguous run and copies outright.
+                for i in 0..mc {
+                    let src = &a[(i0 + i) * k + p0..(i0 + i) * k + p0 + kc];
+                    a_panel[i * kc..i * kc + kc].copy_from_slice(src);
+                }
+                for p in 0..kc {
+                    let src = &b[(p0 + p) * n + j0..(p0 + p) * n + j0 + nc];
+                    b_panel[p * nc..p * nc + nc].copy_from_slice(src);
+                }
+                packed_micro(&a_panel, &b_panel, out, out_ld, mc, nc, kc, i0, j0, p0);
+            }
+        }
+    }
+
+    if j_full < n || i_full < m {
+        for i in i_full..m {
+            for j in 0..n {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    acc = a[i * k + p].mul_add(b[p * n + j], acc);
+                }
+                out[i * out_ld + j] = acc;
+            }
+        }
+        for i in 0..i_full {
+            for j in j_full..n {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    acc = a[i * k + p].mul_add(b[p * n + j], acc);
+                }
+                out[i * out_ld + j] = acc;
+            }
+        }
+    }
+}
+
+/// BLAS `A[m, k] * B[k, n]` on macOS, both operands NoTrans, `out` strided
+/// by the caller's leading dimension.
+#[cfg(target_os = "macos")]
+#[inline]
+fn accelerate_sgemm_nn(
+    a: &[f32],
+    b: &[f32],
+    out: &mut [f32],
+    out_ld: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    // CBLAS integer sizes are signed 32-bit. A Rust Vec cannot approach this
+    // limit in the supported configurations, but the boundary is explicit
+    // rather than silently truncating an unusually large tensor.
+    let (m, k, n) = (
+        i32::try_from(m).expect("matrix row count exceeds CBLAS range"),
+        i32::try_from(k).expect("reduction count exceeds CBLAS range"),
+        i32::try_from(n).expect("matrix column count exceeds CBLAS range"),
+    );
+    let out_ld = i32::try_from(out_ld).expect("out leading dimension exceeds CBLAS range");
+    // SAFETY: slice lengths are asserted by the public caller. The CBLAS row
+    // major dimensions below describe exactly those strided submatrices.
+    unsafe {
+        cblas_sgemm(
+            101, // CblasRowMajor
+            111, // CblasNoTrans
+            111, // CblasNoTrans
+            m,
+            n,
+            k,
+            1.0,
+            a.as_ptr(),
+            k,
+            b.as_ptr(),
+            n,
+            0.0,
+            out.as_mut_ptr(),
+            out_ld,
+        );
+    }
+}
+
 /// Micro-kernel over a panel pair where the `B` panel is stored so that panel
 /// column `j` is contiguous in `k` (i.e. transposed relative to [`packed_micro`]).
 ///

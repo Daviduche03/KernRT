@@ -56,6 +56,12 @@ pub struct LayerWeights {
     pub w1: Matrix,
     pub w2: Matrix,
     pub w3: Matrix,
+    /// Per-head RMSNorm applied to each query before RoPE. `Some` only for
+    /// architectures that normalize q and k per head (Qwen3); `None` for
+    /// Llama/SmolLM2, whose q and k go straight to RoPE.
+    pub rms_q: Option<Tensor>,
+    /// Per-head RMSNorm applied to each key before RoPE.
+    pub rms_k: Option<Tensor>,
 }
 
 /// A parsed checkpoint.
@@ -233,6 +239,8 @@ fn from_bytes(bytes: &[u8]) -> Result<Checkpoint, Llama2cError> {
             w1: Matrix::from_f32(slice(&w1, i, h * d, &[h, d])?),
             w2: Matrix::from_f32(slice(&w2, i, d * h, &[d, h])?),
             w3: Matrix::from_f32(slice(&w3, i, h * d, &[h, d])?),
+            rms_q: None,
+            rms_k: None,
         });
     }
 

@@ -1,4 +1,5 @@
-//! A byte-level BPE tokenizer of the GPT-2 family, as SmolLM2 uses.
+//! A byte-level BPE tokenizer, the HuggingFace `tokenizer.json` format used by
+//! the SmolLM2 and Qwen families.
 //!
 //! This is a different animal from the llama2.c tokenizer in
 //! [`crate::tokenizer::byte_pair`]:
@@ -8,9 +9,11 @@
 //!   representable and there is no unknown token.
 //! * Merges are ranked rather than scored: the pair with the *lowest* rank wins,
 //!   and the vocabulary is not consulted for priority.
-//! * Text is split into words first (the GPT-2 regex), and merges never cross a
-//!   word boundary — a detail that changes the tokenization of numbers and
-//!   punctuation.
+//! * Text is split into words first, and merges never cross a word boundary — a
+//!   detail that changes the tokenization of numbers and punctuation. The split
+//!   rule is model-specific: [`PreTokenizer::Gpt2`] and [`PreTokenizer::Qwen`]
+//!   differ on things like whether `":\n"` is one word, so it is read from the
+//!   file rather than assumed.
 //!
 //! The file format is HuggingFace's `tokenizer.json`, of which only the BPE
 //! model, the added tokens and the pre-tokenizer settings are read.
@@ -22,7 +25,7 @@ use std::fs;
 use std::path::Path;
 
 /// A loaded byte-level BPE tokenizer.
-pub struct Gpt2Tokenizer {
+pub struct BpeTokenizer {
     /// Piece text for each id; the inverse of `vocab`.
     pieces: Vec<String>,
     vocab: HashMap<String, usize>,
@@ -30,13 +33,27 @@ pub struct Gpt2Tokenizer {
     merges: HashMap<(String, String), usize>,
     /// Multi-character special tokens, matched before any BPE splitting.
     added: Vec<(String, usize)>,
+    /// How text is split into words before BPE. The pattern differs per model
+    /// family and changes the result, so it is read from the file rather than
+    /// assumed.
+    pretok: PreTokenizer,
     bos: usize,
     eos: usize,
 }
 
+/// The word-splitting rule a model declares in `pre_tokenizer`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreTokenizer {
+    /// GPT-2's `\p{N}+` splitter, used by SmolLM2 and friends.
+    Gpt2,
+    /// Qwen2/Qwen3's splitter, whose punctuation rule keeps trailing newlines
+    /// and whose digit rule is single-character.
+    Qwen,
+}
+
 /// Everything that can go wrong reading a `tokenizer.json`.
 #[derive(Debug)]
-pub enum Gpt2Error {
+pub enum BpeError {
     Io(std::io::Error),
     Json(serde_json::Error),
     /// A field the loader needs was missing or the wrong shape.
@@ -45,60 +62,58 @@ pub enum Gpt2Error {
     BadMerge(usize),
 }
 
-impl fmt::Display for Gpt2Error {
+impl fmt::Display for BpeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Gpt2Error::Io(e) => write!(f, "i/o error: {e}"),
-            Gpt2Error::Json(e) => write!(f, "tokenizer json error: {e}"),
-            Gpt2Error::BadFile(what) => write!(f, "tokenizer.json is missing {what}"),
-            Gpt2Error::BadMerge(at) => write!(f, "merge {at} is malformed"),
+            BpeError::Io(e) => write!(f, "i/o error: {e}"),
+            BpeError::Json(e) => write!(f, "tokenizer json error: {e}"),
+            BpeError::BadFile(what) => write!(f, "tokenizer.json is missing {what}"),
+            BpeError::BadMerge(at) => write!(f, "merge {at} is malformed"),
         }
     }
 }
 
-impl std::error::Error for Gpt2Error {
+impl std::error::Error for BpeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Gpt2Error::Io(e) => Some(e),
-            Gpt2Error::Json(e) => Some(e),
+            BpeError::Io(e) => Some(e),
+            BpeError::Json(e) => Some(e),
             _ => None,
         }
     }
 }
 
-impl From<std::io::Error> for Gpt2Error {
+impl From<std::io::Error> for BpeError {
     fn from(e: std::io::Error) -> Self {
-        Gpt2Error::Io(e)
+        BpeError::Io(e)
     }
 }
 
-impl From<serde_json::Error> for Gpt2Error {
+impl From<serde_json::Error> for BpeError {
     fn from(e: serde_json::Error) -> Self {
-        Gpt2Error::Json(e)
+        BpeError::Json(e)
     }
 }
 
-impl Gpt2Tokenizer {
+impl BpeTokenizer {
     /// Read a `tokenizer.json`.
-    pub fn load(path: impl AsRef<Path>) -> Result<Self, Gpt2Error> {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, BpeError> {
         Self::from_json(&fs::read_to_string(path)?)
     }
 
-    fn from_json(text: &str) -> Result<Self, Gpt2Error> {
+    fn from_json(text: &str) -> Result<Self, BpeError> {
         let root: Value = serde_json::from_str(text)?;
 
         let vocab_json = root
             .pointer("/model/vocab")
             .and_then(Value::as_object)
-            .ok_or(Gpt2Error::BadFile("model.vocab"))?;
+            .ok_or(BpeError::BadFile("model.vocab"))?;
         let mut pieces = vec![String::new(); vocab_json.len()];
         let mut vocab = HashMap::with_capacity(vocab_json.len());
         for (piece, id) in vocab_json {
-            let id = id
-                .as_u64()
-                .ok_or(Gpt2Error::BadFile("a numeric vocab id"))? as usize;
+            let id = id.as_u64().ok_or(BpeError::BadFile("a numeric vocab id"))? as usize;
             if id >= pieces.len() {
-                return Err(Gpt2Error::BadFile("vocab ids within range"));
+                return Err(BpeError::BadFile("vocab ids within range"));
             }
             pieces[id] = piece.clone();
             vocab.insert(piece.clone(), id);
@@ -107,12 +122,28 @@ impl Gpt2Tokenizer {
         let merges_json = root
             .pointer("/model/merges")
             .and_then(Value::as_array)
-            .ok_or(Gpt2Error::BadFile("model.merges"))?;
+            .ok_or(BpeError::BadFile("model.merges"))?;
         let mut merges = HashMap::with_capacity(merges_json.len());
         for (rank, entry) in merges_json.iter().enumerate() {
-            let pair = entry.as_str().ok_or(Gpt2Error::BadMerge(rank))?;
-            let (first, second) = pair.split_once(' ').ok_or(Gpt2Error::BadMerge(rank))?;
-            merges.insert((first.to_string(), second.to_string()), rank);
+            // Two spellings in the wild: GPT-2's `"first second"` string and
+            // the newer `["first", "second"]` pair (Qwen and most recent
+            // tokenizers).
+            let pair = match entry {
+                Value::String(s) => s
+                    .split_once(' ')
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+                    .ok_or(BpeError::BadMerge(rank))?,
+                Value::Array(pair) => {
+                    let first = pair.first().and_then(Value::as_str);
+                    let second = pair.get(1).and_then(Value::as_str);
+                    match (first, second) {
+                        (Some(a), Some(b)) => (a.to_string(), b.to_string()),
+                        _ => return Err(BpeError::BadMerge(rank)),
+                    }
+                }
+                _ => return Err(BpeError::BadMerge(rank)),
+            };
+            merges.insert(pair, rank);
         }
 
         // Added tokens carry their own ids and may sort after the BPE vocab.
@@ -123,7 +154,7 @@ impl Gpt2Tokenizer {
                     entry.get("content").and_then(Value::as_str),
                     entry.get("id").and_then(Value::as_u64),
                 ) else {
-                    return Err(Gpt2Error::BadFile("added_tokens entries"));
+                    return Err(BpeError::BadFile("added_tokens entries"));
                 };
                 let id = id as usize;
                 if id >= pieces.len() {
@@ -145,11 +176,12 @@ impl Gpt2Tokenizer {
         let bos = find("bos_token", 1);
         let eos = find("eos_token", 0);
 
-        Ok(Gpt2Tokenizer {
+        Ok(BpeTokenizer {
             pieces,
             vocab,
             merges,
             added,
+            pretok: detect_pretokenizer(&root),
             bos,
             eos,
         })
@@ -168,6 +200,21 @@ impl Gpt2Tokenizer {
     /// End-of-sequence id.
     pub fn eos(&self) -> usize {
         self.eos
+    }
+
+    /// Override the end-of-sequence id.
+    ///
+    /// `tokenizer.json` has no top-level `eos_token` field, so Qwen-family
+    /// tokenizers load with the fallback. The model config (`eos_token_id`)
+    /// is the authority; callers that read it pass the value here.
+    pub fn set_eos(&mut self, eos: usize) {
+        self.eos = eos;
+    }
+
+    /// Override the beginning-of-sequence id, for the same reason as
+    /// [`set_eos`](Self::set_eos).
+    pub fn set_bos(&mut self, bos: usize) {
+        self.bos = bos;
     }
 
     /// Encode `text`, prefixing `bos` when `add_bos` is set.
@@ -211,7 +258,11 @@ impl Gpt2Tokenizer {
             return;
         }
         let bytes = byte_level_encode(text);
-        for word in split_words(&bytes) {
+        let words = match self.pretok {
+            PreTokenizer::Gpt2 => split_words(&bytes),
+            PreTokenizer::Qwen => split_words_qwen(&bytes),
+        };
+        for word in words {
             let pieces: Vec<String> = word.chars().map(|c| c.to_string()).collect();
             for piece in self.bpe(pieces) {
                 // A piece that never appeared in the vocabulary would be a
@@ -265,6 +316,27 @@ impl Gpt2Tokenizer {
     /// Id of a piece, if it is in the vocabulary.
     pub fn token_id(&self, piece: &str) -> Option<usize> {
         self.vocab.get(piece).copied()
+    }
+}
+
+/// Pick the pre-tokenizer from the file's declared split pattern.
+///
+/// Only two patterns are supported. Any other declared pattern falls back to
+/// GPT-2, which is the default for models that split with `ByteLevel`'s own
+/// regex (SmolLM2) or that declare no pre-tokenizer at all.
+fn detect_pretokenizer(root: &Value) -> PreTokenizer {
+    let pattern = root
+        .pointer("/pre_tokenizer/pretokenizers/0/pattern/Regex")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            root.pointer("/pre_tokenizer/pattern/Regex")
+                .and_then(Value::as_str)
+        });
+    match pattern {
+        // Qwen2/Qwen3's splitter is recognisable by its single-digit rule and
+        // the punctuation rule that absorbs trailing newlines.
+        Some(p) if p.contains("\\p{N}") && !p.contains("\\p{N}+") => PreTokenizer::Qwen,
+        _ => PreTokenizer::Gpt2,
     }
 }
 
@@ -336,8 +408,140 @@ fn split_whitespace_run(chars: &[char], at: usize, words: &mut Vec<String>) -> u
     i
 }
 
+/// The Qwen2/Qwen3 pre-tokenizer pattern, applied to byte-level text:
+///
+/// ```text
+/// (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}
+///   | ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+/// ```
+///
+/// The rules that differ from GPT-2 and change real tokenizations: a
+/// punctuation run absorbs any trailing newlines (`":\n"` is one word, hence
+/// one token), a digit run is split one digit at a time, and the word leader
+/// may be any non-letter/non-digit/non-newline character, spaces included.
+pub fn split_words_qwen(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut words = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let start = i;
+        // 1. `(?i:'s|'t|'re|'ve|'m|'ll|'d)`.
+        if let Some(len) = contraction_len(&chars, i) {
+            i += len;
+            words.push(chars[start..i].iter().collect());
+            continue;
+        }
+        // 2. `[^\r\n\p{L}\p{N}]?\p{L}+`: a letter run, optionally led by one
+        //    character that is not a letter, digit or newline (a space counts).
+        let mut j = i;
+        if !is_letter(chars[j]) && !is_number(chars[j]) && !is_crlf(chars[j]) {
+            j += 1;
+        }
+        if j < chars.len() && is_letter(chars[j]) {
+            while j < chars.len() && is_letter(chars[j]) {
+                j += 1;
+            }
+            i = j;
+            words.push(chars[start..i].iter().collect());
+            continue;
+        }
+        // 3. `\p{N}`: exactly one digit.
+        if is_number(chars[i]) {
+            i += 1;
+            words.push(chars[start..i].iter().collect());
+            continue;
+        }
+        // 4. ` ?[^\s\p{L}\p{N}]+[\r\n]*`: an optional space, a punctuation run,
+        //    then any trailing newlines.
+        let mut j = i;
+        if chars[j] == 'Ġ' {
+            j += 1;
+        }
+        if j < chars.len() && is_punct(chars[j]) {
+            while j < chars.len() && is_punct(chars[j]) {
+                j += 1;
+            }
+            while j < chars.len() && is_crlf(chars[j]) {
+                j += 1;
+            }
+            i = j;
+            words.push(chars[start..i].iter().collect());
+            continue;
+        }
+        // 5. `\s*[\r\n]+`: a newline run, ignoring any whitespace before it.
+        let mut j = i;
+        while j < chars.len() && is_whitespace(chars[j]) {
+            j += 1;
+        }
+        // Rule 5 needs at least one newline in the run; then split *after* the
+        // last newline, leaving any trailing spaces for the next match.
+        let mut last_newline: Option<usize> = None;
+        if j > i {
+            for (offset, &ch) in chars[i..j].iter().enumerate() {
+                if is_crlf(ch) {
+                    last_newline = Some(i + offset);
+                }
+            }
+        }
+        if let Some(nl) = last_newline {
+            i = nl + 1;
+            words.push(chars[start..i].iter().collect());
+            continue;
+        }
+        // 6/7. `\s+(?!\S)` then `\s+`: a whitespace run. When the run is
+        // followed by a non-space character the regex gives up its last space
+        // so that space can lead the next word (`"  x"` is `["Ġ", "Ġx"]`);
+        // otherwise the whole run is one piece.
+        let mut end = j;
+        if j < chars.len() && !is_whitespace(chars[j]) && end - i > 1 {
+            end -= 1;
+        }
+        i = end;
+        words.push(chars[start..i].iter().collect());
+    }
+    words
+}
+
+/// Match one of `'s 't 're 've 'm 'll 'd` (case-insensitive) at `at`.
+fn contraction_len(chars: &[char], at: usize) -> Option<usize> {
+    if chars.get(at) != Some(&'\'') {
+        return None;
+    }
+    let rest: String = chars[at + 1..].iter().collect::<String>().to_lowercase();
+    for suffix in ["'s", "'t", "'re", "'ve", "'m", "'ll", "'d"] {
+        // `rest` begins after the quote, so compare against the suffix minus it.
+        if rest.starts_with(&suffix[1..]) {
+            return Some(suffix.len());
+        }
+    }
+    None
+}
+
+/// The byte-level markers for carriage return (0x0D) and newline (0x0A).
+fn is_crlf(ch: char) -> bool {
+    matches!(ch, 'Ċ' | 'č')
+}
+
+fn is_letter(ch: char) -> bool {
+    Class::of(ch) == Class::Letter
+}
+
+fn is_number(ch: char) -> bool {
+    Class::of(ch) == Class::Decimal
+}
+
+fn is_whitespace(ch: char) -> bool {
+    matches!(Class::of(ch), Class::Space | Class::OtherWhitespace)
+}
+
+/// Anything that is not a letter, digit or whitespace — Qwen's punctuation
+/// class (the byte-level text keeps punctuation as itself).
+fn is_punct(ch: char) -> bool {
+    Class::of(ch) == Class::Other
+}
+
 /// The character classes the GPT-2 pattern treats as atomic runs.
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 enum Class {
     Decimal,
     Letter,
@@ -438,7 +642,7 @@ mod tests {
     /// The vocabulary in these tests is written in *byte-level* form. Letters
     /// map to themselves, so `a` is the piece for byte `a`; only non-printable
     /// bytes (space, control characters) are shifted, so a space is `Ġ`.
-    fn tiny() -> Gpt2Tokenizer {
+    fn tiny() -> BpeTokenizer {
         let mut vocab = serde_json::Map::new();
         let pieces = [
             "<|endoftext|>",
@@ -462,7 +666,7 @@ mod tests {
             "bos_token": "<|endoftext|>",
             "eos_token": "<|endoftext|>",
         });
-        Gpt2Tokenizer::from_json(&json.to_string()).unwrap()
+        BpeTokenizer::from_json(&json.to_string()).unwrap()
     }
 
     #[test]
@@ -514,5 +718,42 @@ mod tests {
     fn matches_added_tokens_before_bpe() {
         let tokenizer = tiny();
         assert_eq!(tokenizer.encode("ab<|endoftext|>", false), vec![4, 0]);
+    }
+
+    #[test]
+    fn detects_the_qwen_splitter_from_the_declared_pattern() {
+        let qwen = serde_json::json!({
+            "pre_tokenizer": { "type": "Sequence", "pretokenizers": [
+                { "type": "Split", "pattern": { "Regex":
+                    "(?i:'s|'t)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*" } },
+                { "type": "ByteLevel" }
+            ]}
+        });
+        assert_eq!(detect_pretokenizer(&qwen), PreTokenizer::Qwen);
+        let gpt2 = serde_json::json!({
+            "pre_tokenizer": { "type": "ByteLevel", "use_regex": true }
+        });
+        assert_eq!(detect_pretokenizer(&gpt2), PreTokenizer::Gpt2);
+        assert_eq!(
+            detect_pretokenizer(&serde_json::json!({})),
+            PreTokenizer::Gpt2
+        );
+    }
+
+    /// The Qwen splitter differs from GPT-2 exactly where its regex does: a
+    /// punct run keeps trailing newlines, digits split one at a time, and a
+    /// space can lead a word. These expected splits are the reference
+    /// tokenizer's (`tokenizers` crate) for the same inputs.
+    #[test]
+    fn qwen_splits_like_the_reference() {
+        let split = |s: &str| split_words_qwen(&byte_level_encode(s));
+        // ":\n" stays one word, so it BPEs to a single token.
+        assert_eq!(split("State:\n"), vec!["State", ":Ċ"]);
+        assert_eq!(split("3/10.\n"), vec!["3", "/", "1", "0", ".Ċ"]);
+        assert_eq!(split("ab12"), vec!["ab", "1", "2"]);
+        assert_eq!(
+            split("  leading and trailing   "),
+            vec!["Ġ", "Ġleading", "Ġand", "Ġtrailing", "ĠĠĠ"]
+        );
     }
 }

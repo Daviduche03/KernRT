@@ -14,7 +14,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/smollm2");
+    let dir = std::env::var("KERNRT_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/smollm2"));
     let n: usize = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())

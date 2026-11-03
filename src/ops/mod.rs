@@ -716,4 +716,20 @@ mod tests {
             assert!((got - want).abs() <= tolerance, "n={n}: {got} vs {want}");
         }
     }
+
+    /// The device backends store weights as bf16, so the conversion has to be
+    /// a correct rounding — and a matrix that is already bf16 must keep its
+    /// exact bits rather than round-trip through f32.
+    #[test]
+    fn bf16_bits_round_to_the_stored_width() {
+        for &v in &[0.0f32, 1.0, -1.0, 0.1, 0.123456, 1e-3, -1234.5, 1e20] {
+            let m = Matrix::from_f32(t(vec![v], &[1, 1]));
+            let bits = m.to_bf16_bits();
+            let back = crate::ops::bf16_to_f32(bits[0]);
+            let tolerance = v.abs() * 0.0039 + f32::MIN_POSITIVE;
+            assert!((back - v).abs() <= tolerance, "{v} -> {back}");
+        }
+        let exact = Matrix::from_bf16_bits(vec![0x3f80, 0xbf80, 0x0000], 1, 3);
+        assert_eq!(exact.to_bf16_bits(), vec![0x3f80, 0xbf80, 0x0000]);
+    }
 }

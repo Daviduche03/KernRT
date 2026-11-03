@@ -18,6 +18,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "macros
 image = { version = "0.25", optional = true }
 base64 = { version = "0.22", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset"], optional = true }
+# macOS only. Opt-in so a Linux or CPU-only build never links it.
+metal = { version = "0.29", optional = true }
 
 [features]
 # The HTTP serving layer. Off by default so an embedded build links neither
@@ -30,6 +32,10 @@ serve = [
     "dep:base64",
     "dep:reqwest",
 ]
+
+# The Metal compute backend. Off by default: it needs a GPU and a macOS SDK at
+# build time, and the CPU path is the reference implementation.
+metal = ["dep:metal"]
 
 # `serve` imports `kernrt::serve`, which only exists under the feature.
 [[example]]

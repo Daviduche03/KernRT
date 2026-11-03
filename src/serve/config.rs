@@ -127,6 +127,11 @@ pub struct Entry {
     /// Omit it and only `/v1/completions` (raw prompts) works.
     #[serde(default)]
     pub chat_template: Option<ChatTemplate>,
+    /// Compute backend for this model. Omitted means `KERNRT_BACKEND`, which
+    /// itself defaults to `cpu`. Only `generate` models honour it today; the
+    /// detector runs on `tract` and the decision head is built on `Llama`.
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 impl Manifest {
@@ -215,7 +220,12 @@ impl Entry {
                 )))
             }
             "generate" => {
-                let model = Llama::from_hf(&self.path).map_err(|error| {
+                let backend = match self.backend.as_deref() {
+                    Some(name) => crate::backends::open(name)
+                        .map_err(|error| ServeError::bad_request(format!("{id}: {error}")))?,
+                    None => crate::backends::from_env(),
+                };
+                let model = Llama::from_hf_with(&self.path, backend).map_err(|error| {
                     ServeError::internal(format!("{id}: cannot load language model: {error}"))
                 })?;
                 let tokenizer_path = self.path.join("tokenizer.json");
@@ -303,6 +313,7 @@ mod tests {
             height: None,
             seq_len: None,
             chat_template: None,
+            backend: None,
         };
         let manifest = Manifest {
             models: vec![entry.clone(), entry],
@@ -324,6 +335,7 @@ mod tests {
             height: None,
             seq_len: None,
             chat_template: None,
+            backend: None,
         };
         let manifest = Manifest {
             models: vec![entry],

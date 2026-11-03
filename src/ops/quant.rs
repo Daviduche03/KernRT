@@ -582,12 +582,45 @@ impl Matrix {
         Tensor::from_vec(data, &[out_dim, in_dim]).expect("shape matches the data")
     }
 
-    /// Read row `index` as f32 — used for the token-embedding lookup.
-    pub fn row(&self, index: usize) -> Vec<f32> {
-        let (start, end) = (index * self.in_dim(), (index + 1) * self.in_dim());
+    /// The whole matrix as bf16 bit patterns, row-major `[out, in]`.
+    ///
+    /// The device backends store weights at half the f32 width, because decode
+    /// re-reads every weight for every token and is bound by those bytes, not
+    /// by the arithmetic. A matrix already stored as bf16 keeps its exact bits;
+    /// anything else is rounded to nearest even.
+    pub fn to_bf16_bits(&self) -> Vec<u16> {
         match self {
-            Matrix::F32(t) => t.data()[start..end].to_vec(),
-            Matrix::Bf16 { data, .. } => data[start..end].iter().map(|&b| bf16_to_f32(b)).collect(),
+            Matrix::Bf16 { data, .. } => data.clone(),
+            Matrix::F32(t) => t.data().iter().map(|&v| f32_to_bf16_bits(v)).collect(),
+            _ => {
+                let (out_dim, in_dim) = (self.out_dim(), self.in_dim());
+                let mut bits = Vec::with_capacity(out_dim * in_dim);
+                let mut row = vec![0.0f32; in_dim];
+                for r in 0..out_dim {
+                    self.decode_row(r, &mut row);
+                    bits.extend(row.iter().map(|&v| f32_to_bf16_bits(v)));
+                }
+                bits
+            }
+        }
+    }
+
+    /// Decode row `index` as f32 into `out`, which must be `in_dim` long.
+    ///
+    /// The allocation-free form of [`row`](Self::row), for callers that decode
+    /// every row of a matrix in turn — the scalar reference backend does
+    /// exactly that, and a `Vec` per row would dominate its runtime.
+    pub fn decode_row(&self, index: usize, out: &mut [f32]) {
+        let in_dim = self.in_dim();
+        debug_assert_eq!(out.len(), in_dim, "row buffer must hold in_dim values");
+        let (start, end) = (index * in_dim, (index + 1) * in_dim);
+        match self {
+            Matrix::F32(t) => out.copy_from_slice(&t.data()[start..end]),
+            Matrix::Bf16 { data, .. } => {
+                for (o, &b) in out.iter_mut().zip(&data[start..end]) {
+                    *o = bf16_to_f32(b);
+                }
+            }
             Matrix::Q8_0 {
                 scales,
                 quants,
@@ -599,18 +632,36 @@ impl Matrix {
                     &quants[start..end],
                     &scales[index * blocks..(index + 1) * blocks],
                 );
-                let mut out = Vec::with_capacity(*in_dim);
                 for (block, &scale) in ss.iter().enumerate() {
                     let lo = block * Q8_0_BLOCK;
-                    for &q in &qs[lo..lo + Q8_0_BLOCK] {
-                        out.push(f32::from(q) * scale);
+                    for (o, &q) in out[lo..lo + Q8_0_BLOCK]
+                        .iter_mut()
+                        .zip(&qs[lo..lo + Q8_0_BLOCK])
+                    {
+                        *o = f32::from(q) * scale;
                     }
                 }
-                out
             }
-            Matrix::Q8_0x4(q) => q.row(index),
+            Matrix::Q8_0x4(q) => out.copy_from_slice(&q.row(index)),
         }
     }
+
+    /// Read row `index` as f32 — used for the token-embedding lookup.
+    pub fn row(&self, index: usize) -> Vec<f32> {
+        let mut out = vec![0.0; self.in_dim()];
+        self.decode_row(index, &mut out);
+        out
+    }
+}
+
+/// Round an f32 to bf16, nearest-even, and return the bit pattern.
+///
+/// bf16 is the top 16 bits of an f32, so this is a rounding of the discarded
+/// mantissa rather than a different format.
+fn f32_to_bf16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let lsb = (bits >> 16) & 1;
+    (bits.wrapping_add(0x7fff + lsb) >> 16) as u16
 }
 
 /// Elements per quantization block in the Q8_0 layout.

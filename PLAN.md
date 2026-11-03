@@ -12,17 +12,20 @@ other targets.
 
 ## What exists
 
-One model family (Llama-2 style: TinyStories, SmolLM2-135M and SmolLM2-360M),
-one device (CPU, NEON), one sequence at a time.
+Model families: Llama-2 style (TinyStories, SmolLM2-135M/360M/1.7B),
+Qwen3-0.6B, a dense MNIST classifier and YOLO26. Three compute backends
+(`cpu`, `metal`, and a scalar `reference` oracle), one sequence at a time.
 
 Laid out by role: `ops` (kernels), `formats` (weight readers), `tokenizer`,
-`arch` (runnable networks), on top of `tensor`. `arch` is split by family
-(`llm`, `vision`); a decoder implements `arch::llm::LanguageModel`, which is
-all the `generate` loop needs, so it never names a concrete architecture.
+`backends` (the compute seam), `arch` (runnable networks), on top of `tensor`.
+`arch` is split by family (`llm`, `vision`); a decoder implements
+`arch::llm::LanguageModel`, which is all the `generate` loop needs, so it never
+names a concrete architecture.
 
 | piece | notes |
 |---|---|
 | `tensor.rs` | rank-2 f32 tensors, contiguous row-major |
+| `backends/` | the compute seam: `cpu`, `metal`, and the scalar `reference` oracle |
 | `ops/` | matmul (scalar/tiled/packed/NEON), gemv, Q8_0 kernels, norms, softmax, transpose |
 | `arch/llm/llama.rs` | forward pass, GQA, RoPE (both layouts), KV cache |
 | `arch/llm/hf.rs` | HF loader: `config.json` parser, storage policy, tensor extraction |
@@ -300,6 +303,32 @@ tok/s against the 30 tok/s of simply looping the decode path. Anything at this
 size needs the batched path to read weights in their stored format instead of
 converting them, which is the same conclusion item 1 reaches from the other
 direction.
+
+### Backends: CPU against Metal
+
+The seam in `src/backends/` makes compute pluggable, and a second
+implementation exists to test whether that is worth anything. M1, bf16, CPU
+single-thread; prefill of 128 tokens, and `tg1` decode:
+
+| model | prefill CPU | prefill Metal | decode CPU | decode Metal |
+|---|---|---|---|---|
+| 135M | 1212 | 1144 | 75.5 | 47.5 |
+| 360M | 536 | 533 | 26.2 | 24.8 |
+| 1.7B | 11 | 146 | 11.0 | 8.9 |
+
+Prefill at 1.7B is **13.3x** faster on the GPU, and the mechanism is item 2 read
+from the other direction: the CPU path builds a 6.4 GB f32 copy there and
+swaps, while Metal holds 3.4 GB of bf16 once. Decode stays with the CPU, which
+is already at the bandwidth wall; the GPU pays a dispatch and a synchronisation
+per projection and loses at 135M by 1.6x.
+
+What makes the comparison usable is that both sides come from one binary and one
+oracle. `tests/backends.rs` builds a synthetic model with no fixture and
+requires every backend to reproduce the scalar one on decode, batched prefill
+and a shared prefix; output on SmolLM2-1.7B is byte-identical between the two.
+Activations cross the backend API as `Buf` handles, so a GPU backend encodes a
+whole step and synchronises once instead of once per projection — that change
+alone took Metal decode from 7.6 to 47.5 tok/s at 135M.
 
 ## The one bottleneck behind every remaining loss
 
@@ -579,8 +608,11 @@ which must be left alone.
 ## Known caveats
 
 * Q8_0 is not bit-reproducible against the f32 path. bf16 is (cosine 1.0).
-* Prefill exists only for f32/bf16, and is currently reverted and being
-  rebuilt.
+* Prefill runs the batched path for f32, bf16 and Q8_0x4; plain Q8_0 falls
+  back to the decode loop. Q8_0x4 can also prefill on an f32 copy, 2.13x
+  faster (573 -> 1223 tok/s at 135M), but that is a different arithmetic —
+  exact weights and activations instead of int8 for both — so it is opt-in
+  (`KERNRT_PREFILL_F32=1`) rather than the default.
 * No output-level validation against llama.cpp; we use its GGUFs for speed
   comparison only.
 * Model fixtures live in `target/` and are gitignored, so a fresh clone has

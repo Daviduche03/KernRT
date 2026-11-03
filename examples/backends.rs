@@ -25,7 +25,9 @@ fn argmax(v: &[f32]) -> usize {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/smollm2");
+    let dir = std::env::var("KERNRT_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/smollm2"));
     let tokenizer = BpeTokenizer::load(dir.join("tokenizer.json"))?;
     let mut args = std::env::args().skip(1);
     let prompt = args

@@ -2,6 +2,9 @@
 name = "kernrt"
 version = "0.1.0"
 edition = "2024"
+description = "A hand-written inference runtime for Apple silicon: CPU (NEON/SDOT) and Metal backends behind one tested seam."
+repository = "https://github.com/Daviduche03/KernRT"
+readme = "README.md"
 
 [dependencies]
 memmap2 = "0.9.11"

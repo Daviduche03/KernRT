@@ -12,6 +12,35 @@ use std::sync::Arc;
 
 use super::{AttnSpec, Backend, Buf, KvSpec, ModelWeights, Proj, RopeSpec, Window};
 
+/// Borrow three distinct elements of a slice mutably. Same construction as
+/// the CPU backend's: order the indices, split twice, reborrow disjointly.
+#[allow(dead_code)]
+fn three_mut<T>(v: &mut [T], i: usize, j: usize, k: usize) -> (&mut T, &mut T, &mut T) {
+    assert!(
+        i != j && j != k && i != k,
+        "buffers must be pairwise distinct"
+    );
+    let mut ord = [i, j, k];
+    ord.sort_unstable();
+    let (lo, hi) = v.split_at_mut(ord[2]);
+    let (lo2, mid) = lo.split_at_mut(ord[1]);
+    // SAFETY: the splits isolate the three slots and the indices are pairwise
+    // distinct, so the pointers never alias.
+    unsafe {
+        let mut p = |n: usize| {
+            if n == ord[2] {
+                hi.as_mut_ptr()
+            } else if n == ord[1] {
+                mid.as_mut_ptr()
+            } else {
+                debug_assert_eq!(n, ord[0]);
+                lo2.as_mut_ptr().add(n)
+            }
+        };
+        (&mut *p(i), &mut *p(j), &mut *p(k))
+    }
+}
+
 pub struct Reference {
     weights: Option<Arc<ModelWeights>>,
     storage: &'static str,
@@ -80,10 +109,7 @@ impl Backend for Reference {
     }
 
     fn prepare(&mut self, weights: Arc<ModelWeights>, kv: KvSpec) {
-        self.storage = weights
-            .layers
-            .first()
-            .map_or("f32", |layer| layer.wq.kind());
+        self.storage = weights.token_embedding.kind();
         self.kv = kv;
         self.key_cache = vec![0.0; kv.n_layers * kv.seq_len * kv.kv_dim];
         self.value_cache = vec![0.0; kv.n_layers * kv.seq_len * kv.kv_dim];
@@ -286,6 +312,86 @@ impl Backend for Reference {
         }
     }
 
+    fn mul(
+        &mut self,
+        out: Buf,
+        out_off: usize,
+        a: Buf,
+        a_off: usize,
+        b: Buf,
+        b_off: usize,
+        len: usize,
+    ) {
+        // Same-index elementwise, so any aliasing is benign; the cases only
+        // exist to satisfy the borrow checker.
+        if out.0 == a.0 && out.0 == b.0 {
+            let v = &mut self.bufs[out.0];
+            for i in 0..len {
+                let x = v[a_off + i];
+                let y = v[b_off + i];
+                v[out_off + i] = x * y;
+            }
+            return;
+        }
+        if out.0 == a.0 {
+            let (o, bv) = two_mut(&mut self.bufs, out.0, b.0);
+            for i in 0..len {
+                let x = o[a_off + i];
+                o[out_off + i] = x * bv[b_off + i];
+            }
+            return;
+        }
+        if out.0 == b.0 {
+            let (o, av) = two_mut(&mut self.bufs, out.0, a.0);
+            for i in 0..len {
+                let y = o[b_off + i];
+                o[out_off + i] = av[a_off + i] * y;
+            }
+            return;
+        }
+        if a.0 == b.0 {
+            let (ab, o) = two_mut(&mut self.bufs, a.0, out.0);
+            for i in 0..len {
+                o[out_off + i] = ab[a_off + i] * ab[b_off + i];
+            }
+            return;
+        }
+        let (o, av, bv) = three_mut(&mut self.bufs, out.0, a.0, b.0);
+        for i in 0..len {
+            o[out_off + i] = av[a_off + i] * bv[b_off + i];
+        }
+    }
+
+    fn conv_prefill(&mut self, out: Buf, x: Buf, kernel: Buf, rows: usize, dim: usize, k: usize) {
+        let xv = self.bufs[x.0].clone();
+        let kv = self.bufs[kernel.0].clone();
+        let ov = &mut self.bufs[out.0];
+        conv_rows(&xv, &kv, ov, rows, dim, k);
+    }
+
+    fn conv_decode(&mut self, out: Buf, x: Buf, kernel: Buf, state: Buf, dim: usize, k: usize) {
+        let sv = self.bufs[state.0].clone();
+        let xv = self.bufs[x.0].clone();
+        let kv = self.bufs[kernel.0].clone();
+        let hist_len = k - 1;
+        let mut hist = Vec::with_capacity(k * dim);
+        hist.extend_from_slice(&sv[..hist_len * dim]);
+        hist.extend_from_slice(&xv[..dim]);
+        // The history is itself a k-row series; the wanted output is its
+        // last row (the first k-1 rows are the zero-padded prefix).
+        let ov = &mut self.bufs[out.0];
+        let mut full = vec![0.0f32; k * dim];
+        conv_rows(&hist, &kv, &mut full, k, dim, k);
+        ov[..dim].copy_from_slice(&full[(k - 1) * dim..]);
+        if hist_len > 0 {
+            let sv = &mut self.bufs[state.0];
+            if hist_len > 1 {
+                sv.copy_within(dim..hist_len * dim, 0);
+            }
+            sv[(hist_len - 1) * dim..hist_len * dim].copy_from_slice(&xv[..dim]);
+        }
+    }
+
     fn silu_mul(&mut self, gate: Buf, up: Buf, len: usize) {
         let (g, u) = two_mut(&mut self.bufs, gate.0, up.0);
         for i in 0..len {
@@ -373,6 +479,25 @@ fn attention_rows(
             for o in 0..spec.head_size {
                 out[o] += a * value_cache[at + o];
             }
+        }
+    }
+}
+
+/// Reference causal depthwise convolution: the same arithmetic as the
+/// CPU backend's, written without sharing any code with it.
+/// Reference causal depthwise convolution: the same arithmetic as the CPU
+/// backend's, written without sharing any code with it.
+fn conv_rows(x: &[f32], kernel: &[f32], out: &mut [f32], rows: usize, dim: usize, k: usize) {
+    for r in 0..rows {
+        for i in 0..dim {
+            let mut acc = 0.0f32;
+            for j in 0..k {
+                let h = r as isize - (k as isize - 1) + j as isize;
+                if h >= 0 {
+                    acc += kernel[i * k + j] * x[h as usize * dim + i];
+                }
+            }
+            out[r * dim + i] = acc;
         }
     }
 }

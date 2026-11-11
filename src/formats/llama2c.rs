@@ -48,20 +48,31 @@ impl Config {
 /// Per-layer weights, each in the row-major `[out, in]` layout `run.c` uses.
 pub struct LayerWeights {
     pub rms_att: Tensor,
-    pub wq: Matrix,
-    pub wk: Matrix,
-    pub wv: Matrix,
-    pub wo: Matrix,
+    pub wq: Option<Matrix>,
+    pub wk: Option<Matrix>,
+    pub wv: Option<Matrix>,
+    pub wo: Option<Matrix>,
     pub rms_ffn: Tensor,
     pub w1: Matrix,
     pub w2: Matrix,
     pub w3: Matrix,
     /// Per-head RMSNorm applied to each query before RoPE. `Some` only for
-    /// architectures that normalize q and k per head (Qwen3); `None` for
-    /// Llama/SmolLM2, whose q and k go straight to RoPE.
+    /// architectures that normalize q and k per head (Qwen3, LFM2 attention
+    /// layers); `None` for Llama/SmolLM2, whose q and k go straight to RoPE.
     pub rms_q: Option<Tensor>,
     /// Per-head RMSNorm applied to each key before RoPE.
     pub rms_k: Option<Tensor>,
+    /// LFM2 short-convolution weights; `None` on attention-only architectures.
+    /// `Some` exactly on the layers whose `is_attention` is false.
+    pub conv_in: Option<Matrix>,
+    /// LFM2 short-convolution output projection, `[dim, dim]`.
+    pub conv_out: Option<Matrix>,
+    /// LFM2 depthwise kernel, `[dim, k]` row-major. Small enough to stay f32
+    /// on every storage: quantizing it would save nothing measurable.
+    pub conv_kernel: Option<Tensor>,
+    /// Whether this layer runs attention (`true`) or, on hybrid models, the
+    /// short convolution. Always true for Llama-format checkpoints.
+    pub is_attention: bool,
 }
 
 /// A parsed checkpoint.
@@ -231,16 +242,20 @@ fn from_bytes(bytes: &[u8]) -> Result<Checkpoint, Llama2cError> {
     for i in 0..l {
         layers.push(LayerWeights {
             rms_att: slice(&rms_att, i, d, &[d])?,
-            wq: Matrix::from_f32(slice(&wq, i, d * d, &[d, d])?),
-            wk: Matrix::from_f32(slice(&wk, i, kv * d, &[kv, d])?),
-            wv: Matrix::from_f32(slice(&wv, i, kv * d, &[kv, d])?),
-            wo: Matrix::from_f32(slice(&wo, i, d * d, &[d, d])?),
+            wq: Some(Matrix::from_f32(slice(&wq, i, d * d, &[d, d])?)),
+            wk: Some(Matrix::from_f32(slice(&wk, i, kv * d, &[kv, d])?)),
+            wv: Some(Matrix::from_f32(slice(&wv, i, kv * d, &[kv, d])?)),
+            wo: Some(Matrix::from_f32(slice(&wo, i, d * d, &[d, d])?)),
             rms_ffn: slice(&rms_ffn, i, d, &[d])?,
             w1: Matrix::from_f32(slice(&w1, i, h * d, &[h, d])?),
             w2: Matrix::from_f32(slice(&w2, i, d * h, &[d, h])?),
             w3: Matrix::from_f32(slice(&w3, i, h * d, &[h, d])?),
             rms_q: None,
             rms_k: None,
+            conv_in: None,
+            conv_out: None,
+            conv_kernel: None,
+            is_attention: true,
         });
     }
 
@@ -363,14 +378,21 @@ mod tests {
         assert_eq!(checkpoint.token_embedding.in_dim(), 4);
         assert_eq!(checkpoint.token_embedding.row(0), vec![0.0, 1.0, 2.0, 3.0]);
         assert_eq!(checkpoint.layers.len(), 2);
-        assert_eq!(checkpoint.layers[0].wq.out_dim(), 4);
-        assert_eq!(checkpoint.layers[0].wq.in_dim(), 4);
-        assert_eq!(checkpoint.layers[0].wk.out_dim(), 2);
-        assert_eq!(checkpoint.layers[0].wk.in_dim(), 4);
+        assert_eq!(checkpoint.layers[0].wq.as_ref().unwrap().out_dim(), 4);
+        assert_eq!(checkpoint.layers[0].wq.as_ref().unwrap().in_dim(), 4);
+        assert_eq!(checkpoint.layers[0].wk.as_ref().unwrap().out_dim(), 2);
+        assert_eq!(checkpoint.layers[0].wk.as_ref().unwrap().in_dim(), 4);
         assert_eq!(checkpoint.layers[0].w1.out_dim(), 8);
         assert_eq!(checkpoint.layers[0].w2.in_dim(), 8);
         assert_eq!(checkpoint.layers[0].w3.out_dim(), 8);
         assert_eq!(checkpoint.rms_final.shape(), &[4]);
+    }
+
+    #[test]
+    fn attention_flag_defaults_to_true_with_no_conv_weights() {
+        let checkpoint = from_bytes(&encode(&config(), true)).unwrap();
+        assert!(checkpoint.layers[0].is_attention);
+        assert!(checkpoint.layers[0].conv_in.is_none());
     }
 
     #[test]

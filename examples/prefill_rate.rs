@@ -7,11 +7,56 @@
 //! KERNRT_Q8_0X4=1 cargo run --release --example prefill_rate -- 128
 //! ```
 
+use kernrt::arch::llm::Lfm2;
 use kernrt::arch::llm::Llama;
 use kernrt::tokenizer::BpeTokenizer;
 use std::error::Error;
 use std::path::PathBuf;
 use std::time::Instant;
+
+/// The benchmarked model, Llama- or LFM2-flavoured.
+enum Model {
+    Llama(Llama),
+    Lfm2(Lfm2),
+}
+
+impl Model {
+    fn load(dir: &std::path::Path) -> Result<Self, Box<dyn Error>> {
+        let config = std::fs::read_to_string(dir.join("config.json"))?;
+        let is_lfm2 = config.contains("\"model_type\": \"lfm2\"")
+            || config.contains("\"model_type\":\"lfm2\"");
+        if is_lfm2 {
+            Ok(Model::Lfm2(Lfm2::from_hf(dir)?))
+        } else {
+            Ok(Model::Llama(Llama::from_hf(dir)?))
+        }
+    }
+
+    fn prefill(&mut self, prompt: &[usize], start: usize) {
+        match self {
+            Model::Llama(m) => {
+                std::hint::black_box(m.prefill(prompt, start));
+            }
+            Model::Lfm2(m) => {
+                std::hint::black_box(m.prefill(prompt, start));
+            }
+        }
+    }
+
+    fn storage(&self) -> &'static str {
+        match self {
+            Model::Llama(m) => m.storage(),
+            Model::Lfm2(m) => m.storage(),
+        }
+    }
+
+    fn seq_len(&self) -> usize {
+        match self {
+            Model::Llama(m) => m.config().seq_len,
+            Model::Lfm2(m) => m.config().seq_len,
+        }
+    }
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     let dir = std::env::var("KERNRT_MODEL")
@@ -22,7 +67,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(128);
 
-    let mut model = Llama::from_hf(&dir)?;
+    let mut model = Model::load(&dir)?;
     let tokenizer = BpeTokenizer::load(dir.join("tokenizer.json"))?;
 
     // Build a prompt of exactly `n` tokens by repeating a sentence, so the
@@ -40,7 +85,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "storage {} | prompt {} tokens | ctx {}",
         model.storage(),
         prompt.len(),
-        model.config().seq_len
+        model.seq_len()
     );
 
     // prefill(prompt, 0) always writes positions 0..n, so repeating it on one
@@ -51,16 +96,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     // scratch. Folding that work into a best-of-N would report a rate no
     // individual steady-state call ever achieves.
     let start = Instant::now();
-    let logits = model.prefill(&prompt, 0);
+    model.prefill(&prompt, 0);
     let first = start.elapsed().as_secs_f64();
-    std::hint::black_box(logits);
 
     let mut samples: Vec<f64> = Vec::with_capacity(20);
     for _ in 0..20 {
         let start = Instant::now();
-        let logits = model.prefill(&prompt, 0);
+        model.prefill(&prompt, 0);
         samples.push(start.elapsed().as_secs_f64());
-        std::hint::black_box(logits);
     }
     samples.sort_by(|a, b| a.total_cmp(b));
     let min = samples[0];

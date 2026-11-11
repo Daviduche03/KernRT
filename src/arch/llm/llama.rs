@@ -285,26 +285,26 @@ impl Llama {
             let p = format!("model.layers.{l}");
             layers.push(LayerWeights {
                 rms_att: take_f32(&mut tensors, &format!("{p}.input_layernorm.weight"))?,
-                wq: take_matrix_raw(
+                wq: Some(take_matrix_raw(
                     &mut tensors,
                     &format!("{p}.self_attn.q_proj.weight"),
                     storage,
-                )?,
-                wk: take_matrix_raw(
+                )?),
+                wk: Some(take_matrix_raw(
                     &mut tensors,
                     &format!("{p}.self_attn.k_proj.weight"),
                     storage,
-                )?,
-                wv: take_matrix_raw(
+                )?),
+                wv: Some(take_matrix_raw(
                     &mut tensors,
                     &format!("{p}.self_attn.v_proj.weight"),
                     storage,
-                )?,
-                wo: take_matrix_raw(
+                )?),
+                wo: Some(take_matrix_raw(
                     &mut tensors,
                     &format!("{p}.self_attn.o_proj.weight"),
                     storage,
-                )?,
+                )?),
                 rms_ffn: take_f32(
                     &mut tensors,
                     &format!("{p}.post_attention_layernorm.weight"),
@@ -314,6 +314,10 @@ impl Llama {
                 w3: take_matrix_raw(&mut tensors, &format!("{p}.mlp.up_proj.weight"), storage)?,
                 rms_q: take_optional_f32(&mut tensors, &format!("{p}.self_attn.q_norm.weight"))?,
                 rms_k: take_optional_f32(&mut tensors, &format!("{p}.self_attn.k_norm.weight"))?,
+                conv_in: None,
+                conv_out: None,
+                conv_kernel: None,
+                is_attention: true,
             });
         }
         // Tied models store no lm_head.

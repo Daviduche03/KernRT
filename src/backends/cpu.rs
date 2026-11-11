@@ -26,7 +26,7 @@ const DEFAULT_WIDEN_BUDGET: usize = 2 << 30;
 
 /// f32 copies of every projection, for the batched GEMMs, indexed
 /// `[layer][Proj::index()]`.
-type Widened = Vec<[Vec<f32>; 7]>;
+type Widened = Vec<[Vec<f32>; 9]>;
 
 pub struct Cpu {
     weights: Option<Arc<ModelWeights>>,
@@ -63,6 +63,34 @@ fn two_mut<T>(v: &mut [T], i: usize, j: usize) -> (&mut T, &mut T) {
     } else {
         let (a, b) = v.split_at_mut(i);
         (&mut b[0], &mut a[j])
+    }
+}
+
+/// Borrow three distinct elements of a slice mutably.
+fn three_mut<T>(v: &mut [T], i: usize, j: usize, k: usize) -> (&mut T, &mut T, &mut T) {
+    assert!(
+        i != j && j != k && i != k,
+        "buffers must be pairwise distinct"
+    );
+    // Order the indices so two splits isolate all three slots.
+    let mut ord = [i, j, k];
+    ord.sort_unstable();
+    let (lo, hi) = v.split_at_mut(ord[2]);
+    let (lo2, mid) = lo.split_at_mut(ord[1]);
+    // SAFETY: `split_at_mut` guarantees the three slots are disjoint, and the
+    // indices are pairwise distinct, so the three pointers never alias.
+    unsafe {
+        let mut p = |n: usize| {
+            if n == ord[2] {
+                hi.as_mut_ptr()
+            } else if n == ord[1] {
+                mid.as_mut_ptr()
+            } else {
+                debug_assert_eq!(n, ord[0]);
+                lo2.as_mut_ptr().add(n)
+            }
+        };
+        (&mut *p(i), &mut *p(j), &mut *p(k))
     }
 }
 
@@ -129,7 +157,10 @@ impl Cpu {
         }
     }
 
-    /// Build the f32 copies the batched path needs.
+    /// Build the f32 copies the batched path needs. Layers only widen the
+    /// projections they carry: attention layers skip the conv pair, conv
+    /// layers skip the attention set, and either side leaves a zero-length
+    /// placeholder the driver never dispatches.
     fn ensure_widened(&mut self) {
         if self.widened.is_some() {
             return;
@@ -139,7 +170,10 @@ impl Cpu {
             .layers
             .iter()
             .map(|layer| {
-                std::array::from_fn(|i| Proj::ALL[i].matrix(layer).to_f32_tensor().into_data())
+                std::array::from_fn(|i| match Proj::ALL[i].matrix_opt(layer) {
+                    Some(m) => m.to_f32_tensor().into_data(),
+                    None => Vec::new(),
+                })
             })
             .collect();
         self.widened = Some(layers);
@@ -156,10 +190,10 @@ impl Backend for Cpu {
     }
 
     fn prepare(&mut self, weights: Arc<ModelWeights>, kv: KvSpec) {
-        self.storage = weights
-            .layers
-            .first()
-            .map_or("f32", |layer| layer.wq.kind());
+        // The embedding is widened with the same storage as every projection,
+        // so it reports the model width without depending on layer 0 being an
+        // attention layer (it is not, on hybrid models).
+        self.storage = weights.token_embedding.kind();
         self.prefill_f32 = self
             .prefill_f32_override
             .unwrap_or_else(|| prefill_f32_policy(&weights));
@@ -375,6 +409,88 @@ impl Backend for Cpu {
         }
     }
 
+    fn mul(
+        &mut self,
+        out: Buf,
+        out_off: usize,
+        a: Buf,
+        a_off: usize,
+        b: Buf,
+        b_off: usize,
+        len: usize,
+    ) {
+        // Same-index elementwise, so any aliasing is benign; the cases below
+        // only exist to satisfy the borrow checker.
+        if out.0 == a.0 && out.0 == b.0 {
+            let v = &mut self.bufs[out.0];
+            for i in 0..len {
+                let x = v[a_off + i];
+                let y = v[b_off + i];
+                v[out_off + i] = x * y;
+            }
+            return;
+        }
+        if out.0 == a.0 {
+            let (o, bv) = two_mut(&mut self.bufs, out.0, b.0);
+            for i in 0..len {
+                let x = o[a_off + i];
+                o[out_off + i] = x * bv[b_off + i];
+            }
+            return;
+        }
+        if out.0 == b.0 {
+            let (o, av) = two_mut(&mut self.bufs, out.0, a.0);
+            for i in 0..len {
+                let y = o[b_off + i];
+                o[out_off + i] = av[a_off + i] * y;
+            }
+            return;
+        }
+        if a.0 == b.0 {
+            let (ab, o) = two_mut(&mut self.bufs, a.0, out.0);
+            for i in 0..len {
+                o[out_off + i] = ab[a_off + i] * ab[b_off + i];
+            }
+            return;
+        }
+        let (o, av, bv) = three_mut(&mut self.bufs, out.0, a.0, b.0);
+        for i in 0..len {
+            o[out_off + i] = av[a_off + i] * bv[b_off + i];
+        }
+    }
+
+    fn conv_prefill(&mut self, out: Buf, x: Buf, kernel: Buf, rows: usize, dim: usize, k: usize) {
+        let xv = self.bufs[x.0].clone();
+        let kv = self.bufs[kernel.0].clone();
+        let ov = &mut self.bufs[out.0];
+        conv_rows(&xv, &kv, ov, rows, dim, k);
+    }
+
+    fn conv_decode(&mut self, out: Buf, x: Buf, kernel: Buf, state: Buf, dim: usize, k: usize) {
+        // History is state (oldest first) followed by the current row.
+        let sv = self.bufs[state.0].clone();
+        let xv = self.bufs[x.0].clone();
+        let kv = self.bufs[kernel.0].clone();
+        let hist_len = k - 1;
+        let mut hist = Vec::with_capacity(k * dim);
+        hist.extend_from_slice(&sv[..hist_len * dim]);
+        hist.extend_from_slice(&xv[..dim]);
+        // The history is itself a k-row series; the wanted output is its
+        // last row (the first k-1 rows are the zero-padded prefix).
+        let ov = &mut self.bufs[out.0];
+        let mut full = vec![0.0f32; k * dim];
+        conv_rows(&hist, &kv, &mut full, k, dim, k);
+        ov[..dim].copy_from_slice(&full[(k - 1) * dim..]);
+        // Drop the oldest row, gain the current one.
+        if hist_len > 0 {
+            let sv = &mut self.bufs[state.0];
+            if hist_len > 1 {
+                sv.copy_within(dim..hist_len * dim, 0);
+            }
+            sv[(hist_len - 1) * dim..hist_len * dim].copy_from_slice(&xv[..dim]);
+        }
+    }
+
     fn silu_mul(&mut self, gate: Buf, up: Buf, len: usize) {
         let (g, u) = two_mut(&mut self.bufs, gate.0, up.0);
         for (x, &v) in g[..len].iter_mut().zip(&u[..len]) {
@@ -416,10 +532,7 @@ fn prefill_f32_policy(weights: &ModelWeights) -> bool {
         Ok("1") | Ok("true") => return true,
         _ => {}
     }
-    let quantized_packed = weights
-        .layers
-        .first()
-        .is_some_and(|layer| matches!(layer.wq, Matrix::Q8_0x4(_)));
+    let quantized_packed = matches!(weights.token_embedding, Matrix::Q8_0x4(_));
     if quantized_packed {
         return false;
     }
@@ -427,12 +540,34 @@ fn prefill_f32_policy(weights: &ModelWeights) -> bool {
         .layers
         .iter()
         .flat_map(|layer| {
-            Proj::ALL
-                .iter()
-                .map(move |proj| proj.matrix(layer).out_dim() * proj.matrix(layer).in_dim() * 4)
+            Proj::ALL.iter().filter_map(move |proj| {
+                proj.matrix_opt(layer).map(|m| m.out_dim() * m.in_dim() * 4)
+            })
         })
         .sum();
     bytes <= DEFAULT_WIDEN_BUDGET
+}
+
+/// Causal depthwise convolution over `rows` rows, shared by prefill and the
+/// single-row decode path.
+///
+/// Output row `r` is `sum_j kernel[i*k+j] * hist[r-k+1+j][i]`, where `hist`
+/// is `x` zero-padded before row 0. `k` is tiny (3 on LFM2), so this is a
+/// direct loop rather than anything blocked.
+fn conv_rows(x: &[f32], kernel: &[f32], out: &mut [f32], rows: usize, dim: usize, k: usize) {
+    for r in 0..rows {
+        for i in 0..dim {
+            let mut acc = 0.0f32;
+            for j in 0..k {
+                // History index `r - (k-1) + j`, zero-padded below zero.
+                let h = r as isize - (k as isize - 1) + j as isize;
+                if h >= 0 {
+                    acc += kernel[i * k + j] * x[h as usize * dim + i];
+                }
+            }
+            out[r * dim + i] = acc;
+        }
+    }
 }
 
 /// Multi-head causal attention for one query row, writing into `out`.

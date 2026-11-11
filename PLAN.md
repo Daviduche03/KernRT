@@ -330,6 +330,40 @@ Activations cross the backend API as `Buf` handles, so a GPU backend encodes a
 whole step and synchronises once instead of once per projection — that change
 alone took Metal decode from 7.6 to 47.5 tok/s at 135M.
 
+### LFM2 hybrid support (350M, 700M)
+
+Liquid's LFM2 alternates short causal depthwise convs with GQA attention (10
+conv + 6 attention layers at these sizes; 22 + 8 at 2.6B, same code). Supporting
+it meant teaching the seam three things rather than forking the driver: two
+projections (`ConvIn`/`ConvOut`), an elementwise `mul` with offsets for the
+`B*x` / `C*y` gates, and a causal depthwise conv with a per-layer ring for
+decode. Attention, norms, RoPE, the MLP and the KV cache are shared with the
+Llama path unchanged.
+
+M1, `VECLIB_MAXIMUM_THREADS=1`; prefill of 128 tokens, `tg1` decode:
+
+| model | prefill CPU bf16 | prefill CPU q8_0x4 | prefill Metal | decode CPU bf16 | decode CPU q8_0x4 | decode Metal |
+|---|---|---|---|---|---|---|
+| 350M | 749 | 303 | 789 | 26.6 | 143.5 | 37.7 |
+| 700M | 28¹ | 146 | 386 | 24.8 | 67.7 | 20.2 |
+
+¹ 700M bf16 trips the 2 GB widen budget and falls back to the row-at-a-time
+loop; forcing the f32 copy (`KERNRT_PREFILL_F32=1`) reaches 402 tok/s. Metal
+stores bf16 regardless of requested storage, so its two columns match by
+construction — and it wins bf16 decode outright at 350M (37.7 vs 26.6).
+
+Correctness is gated the usual way: a synthetic two-layer conv+attention model
+that cpu, reference and Metal (where present) must reproduce on decode and
+prefill, plus the real 350M weights against HF transformers — cosine 0.99991,
+exact argmax and top-5 on "The capital of France is". The 700M run generates
+coherent chat-templated text; both Q8_0x4 runs agree greedily with bf16.
+
+Two things this work surfaced. The Metal test for a new backend must compare
+like storage with like: Metal stores bf16, so the oracle model has to be
+built at bf16, or the "failure" is just the format (this cost an afternoon).
+And `alloc` is zeroed on CPU and uninitialised on Metal, so the conv ring is
+seeded explicitly at model build rather than depending on either.
+
 ## The one bottleneck behind every remaining loss
 
 The micro-kernel. Evidence:

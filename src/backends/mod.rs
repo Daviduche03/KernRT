@@ -58,20 +58,42 @@ pub enum Proj {
     Down,
     /// SwiGLU up projection, `[hidden_dim, dim]`.
     Up,
+    /// LFM2 short-conv input projection, `[3*dim, dim]`. Only live on hybrid
+    /// models, on layers whose weights carry it.
+    ConvIn,
+    /// LFM2 short-conv output projection, `[dim, dim]`.
+    ConvOut,
 }
 
 impl Proj {
-    /// The logical weight this projection reads.
-    pub fn matrix(self, layer: &LayerWeights) -> &Matrix {
+    /// The logical weight this projection reads, or `None` when the layer
+    /// does not carry it: attention projections on a convolution layer, or
+    /// convolution projections on an attention layer.
+    pub fn matrix_opt(self, layer: &LayerWeights) -> Option<&Matrix> {
         match self {
-            Proj::Q => &layer.wq,
-            Proj::K => &layer.wk,
-            Proj::V => &layer.wv,
-            Proj::O => &layer.wo,
-            Proj::Gate => &layer.w1,
-            Proj::Down => &layer.w2,
-            Proj::Up => &layer.w3,
+            Proj::Q => layer.wq.as_ref(),
+            Proj::K => layer.wk.as_ref(),
+            Proj::V => layer.wv.as_ref(),
+            Proj::O => layer.wo.as_ref(),
+            Proj::Gate => Some(&layer.w1),
+            Proj::Down => Some(&layer.w2),
+            Proj::Up => Some(&layer.w3),
+            Proj::ConvIn => layer.conv_in.as_ref(),
+            Proj::ConvOut => layer.conv_out.as_ref(),
         }
+    }
+
+    /// The logical weight this projection reads.
+    ///
+    /// Panics when the layer does not carry it, which means the driver
+    /// dispatched a projection to the wrong layer kind.
+    pub fn matrix(self, layer: &LayerWeights) -> &Matrix {
+        self.matrix_opt(layer).unwrap_or_else(|| {
+            panic!(
+                "projection {self:?} is not live on this layer (is_attention={})",
+                layer.is_attention
+            )
+        })
     }
 
     /// Dense index for backend-side arrays.
@@ -84,11 +106,15 @@ impl Proj {
             Proj::Gate => 4,
             Proj::Down => 5,
             Proj::Up => 6,
+            Proj::ConvIn => 7,
+            Proj::ConvOut => 8,
         }
     }
 
-    /// The seven projections, in [`Proj::index`] order.
-    pub const ALL: [Proj; 7] = [
+    /// All nine projections, in [`Proj::index`] order. Prepare paths iterate
+    /// this and skip the ones a layer does not carry; the driver only ever
+    /// dispatches the live ones.
+    pub const ALL: [Proj; 9] = [
         Proj::Q,
         Proj::K,
         Proj::V,
@@ -96,6 +122,8 @@ impl Proj {
         Proj::Gate,
         Proj::Down,
         Proj::Up,
+        Proj::ConvIn,
+        Proj::ConvOut,
     ];
 }
 
@@ -313,6 +341,41 @@ pub trait Backend: Send {
 
     /// `dst += src` over `len` elements.
     fn add_in_place(&mut self, dst: Buf, src: Buf, len: usize);
+
+    /// `out[i] = a[a_off+i] * b[b_off+i]` over `len` elements.
+    ///
+    /// The offsets let a driver multiply slices of one buffer — the LFM2
+    /// short conv multiplies the `B` and `x` thirds of its input projection
+    /// in place, without materialising either.
+    #[allow(clippy::too_many_arguments)]
+    fn mul(
+        &mut self,
+        out: Buf,
+        out_off: usize,
+        a: Buf,
+        a_off: usize,
+        b: Buf,
+        b_off: usize,
+        len: usize,
+    );
+
+    /// Batched causal depthwise convolution for the LFM2 short conv.
+    ///
+    /// Row `r` of `x` holds `dim` elements; `kernel` holds `dim * k` taps in
+    /// `[dim, k]` order. Output row `r` is the causal sum over the current
+    /// and previous `k - 1` rows of `x`, zero-padded before row 0. The state
+    /// ring the decode path keeps is *not* touched: the driver copies the
+    /// last `k - 1` rows into it with [`copy`](Backend::copy).
+    fn conv_prefill(&mut self, out: Buf, x: Buf, kernel: Buf, rows: usize, dim: usize, k: usize);
+
+    /// Single-row decode through the LFM2 short conv.
+    ///
+    /// `state` holds the previous `k - 1` rows (`(k-1)*dim` elements, oldest
+    /// first). The output is the causal sum over state and `x`; afterwards
+    /// the state drops its oldest row and gains `x`. Reads and writes happen
+    /// in that order, so an output buffer that aliases `x` still sees the
+    /// pre-update history.
+    fn conv_decode(&mut self, out: Buf, x: Buf, kernel: Buf, state: Buf, dim: usize, k: usize);
 
     /// `gate[i] = silu(gate[i]) * up[i]` over `len` elements.
     fn silu_mul(&mut self, gate: Buf, up: Buf, len: usize);

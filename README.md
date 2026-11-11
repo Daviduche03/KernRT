@@ -46,6 +46,29 @@ Against llama.cpp on the same machine, single thread, CPU: decode 1.04–1.13×
 ahead and prefill 1.23–1.27× ahead. `PLAN.md` has the full tables, including
 where those claims were wrong before they were measured properly.
 
+LFM2 hybrid models (22 conv + 8 attention layers at 2.6B, 10 + 6 below),
+same machine, `VECLIB_MAXIMUM_THREADS=1`. Validated against HF transformers
+on 350M (cosine 0.99991, exact argmax and top-5):
+
+Prefill, 128 tokens (tok/s):
+
+| model | CPU bf16 | CPU q8_0x4 | Metal |
+|---|---|---|---|
+| LFM2-350M | 749 | 303 | 789 |
+| LFM2-700M | 28¹ | 146 | 386 |
+
+Decode, one token (tok/s):
+
+| model | CPU bf16 | CPU q8_0x4 | Metal |
+|---|---|---|---|
+| LFM2-350M | 26.6 | 143.5 | 37.7 |
+| LFM2-700M | 24.8 | 67.7 | 20.2 |
+
+¹ 700M bf16 prefill trips the 2 GB widen budget and falls back to the
+row-at-a-time loop; `KERNRT_PREFILL_F32=1` forces the f32 copy and reaches
+402 tok/s on CPU. Metal stores bf16 regardless of the requested storage, so
+its bf16 and q8_0x4 columns match by construction.
+
 ## Quick start
 
 Fixtures are not in the repository — see [Model fixtures](#model-fixtures).
@@ -101,10 +124,17 @@ src/serve/           optional axum layer (feature = "serve")
 |---|---|---|
 | TinyStories | llama2.c | `arch::llm::Llama::load` |
 | SmolLM2-135M / 360M / 1.7B | HF safetensors | `Llama::from_hf` |
+| LFM2-350M / 700M (1.2B/2.6B share the code) | HF safetensors | `Lfm2::from_hf` |
 | Qwen3-0.6B | HF safetensors | `Llama::from_hf` |
 | NanoJev decision head | HF + head | `arch::decision` |
 | MNIST MLP | `.krt` / safetensors | `arch::vision::mlp` |
 | YOLO26 | ONNX (via `tract`) | `arch::vision::yolo26` |
+
+LFM2 is the hybrid architecture (short depthwise conv + GQA attention):
+10 conv + 6 attention layers at 350M/700M/1.2B, 22 + 8 at 2.6B. The context is
+capped at 8192 (checkpoints declare 128k, which would make the KV cache
+gigabytes on its own). `KERNRT_MODEL=target/lfm2_350m` selects the checkout;
+`examples/lfm2_generate.rs` generates with it.
 
 Storage is chosen at load: `KERNRT_Q8_0=1`, `KERNRT_Q8_0X4=1`,
 `KERNRT_ALL_F32=1`, and `KERNRT_PREFILL_F32=1` for the wider batched prefill

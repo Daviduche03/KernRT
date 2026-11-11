@@ -324,6 +324,56 @@ kernel void silu_mul(device float* g         [[buffer(0)]],
                      uint i [[thread_position_in_grid]]) {
     if (i < n) g[i] = (g[i] / (1.0f + exp(-g[i]))) * u[i];
 }
+
+// out[i] = a[a_off + i] * b[b_off + i]. Offsets are element counts.
+kernel void mul_offsets(device float* out       [[buffer(0)]],
+                        device const float* a    [[buffer(1)]],
+                        device const float* b    [[buffer(2)]],
+                        constant uint& out_off   [[buffer(3)]],
+                        constant uint& a_off     [[buffer(4)]],
+                        constant uint& b_off     [[buffer(5)]],
+                        constant uint& n         [[buffer(6)]],
+                        uint i [[thread_position_in_grid]]) {
+    if (i < n) out[out_off + i] = a[a_off + i] * b[b_off + i];
+}
+
+// Batched causal depthwise convolution over rows of `x`.
+// grid = (dim, rows). Row r sees rows max(0, r-k+1)..=r of x.
+kernel void conv_prefill(device float* out        [[buffer(0)]],
+                         device const float* x    [[buffer(1)]],
+                         device const float* kw   [[buffer(2)]],
+                         constant uint& dim       [[buffer(3)]],
+                         constant uint& rows      [[buffer(4)]],
+                         constant uint& k         [[buffer(5)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    uint i = gid.x;
+    uint r = gid.y;
+    if (i >= dim || r >= rows) return;
+    float acc = 0.0f;
+    for (uint j = 0; j < k; ++j) {
+        int h = int(r) - int(k) + 1 + int(j);
+        if (h >= 0) acc = fma(kw[i * k + j], x[uint(h) * dim + i], acc);
+    }
+    out[r * dim + i] = acc;
+}
+
+// Single-row decode through the state ring: history is state (oldest first)
+// followed by x, then state drops its oldest row and gains x.
+kernel void conv_decode(device float* out       [[buffer(0)]],
+                        device const float* x    [[buffer(1)]],
+                        device const float* kw   [[buffer(2)]],
+                        device float* state      [[buffer(3)]],
+                        constant uint& dim       [[buffer(4)]],
+                        constant uint& k         [[buffer(5)]],
+                        uint i [[thread_position_in_grid]]) {
+    if (i >= dim) return;
+    float acc = 0.0f;
+    for (uint j = 0; j < k - 1; ++j) acc = fma(kw[i * k + j], state[j * dim + i], acc);
+    acc = fma(kw[i * k + k - 1], x[i], acc);
+    out[i] = acc;
+    for (uint j = 0; j + 1 < k - 1; ++j) state[j * dim + i] = state[(j + 1) * dim + i];
+    if (k > 1) state[(k - 2) * dim + i] = x[i];
+}
 "#;
 
 #[derive(Clone, Copy, Debug)]
@@ -346,11 +396,14 @@ pub struct Metal {
     attn_apply_pipeline: ComputePipelineState,
     add_pipeline: ComputePipelineState,
     silu_pipeline: ComputePipelineState,
+    mul_pipeline: ComputePipelineState,
+    conv_prefill_pipeline: ComputePipelineState,
+    conv_decode_pipeline: ComputePipelineState,
     copy_pipeline: ComputePipelineState,
     kv_write_pipeline: ComputePipelineState,
     /// Every projection of every layer plus the classifier, concatenated.
     weights: Buffer,
-    layers: Vec<[Layout; 7]>,
+    layers: Vec<[Layout; 9]>,
     classifier: Layout,
     weights_host: Option<Arc<ModelWeights>>,
     bufs: Vec<Buffer>,
@@ -399,6 +452,9 @@ impl Metal {
             attn_apply_pipeline: pipeline(&device, &library, "attn_apply")?,
             add_pipeline: pipeline(&device, &library, "add_in_place")?,
             silu_pipeline: pipeline(&device, &library, "silu_mul")?,
+            mul_pipeline: pipeline(&device, &library, "mul_offsets")?,
+            conv_prefill_pipeline: pipeline(&device, &library, "conv_prefill")?,
+            conv_decode_pipeline: pipeline(&device, &library, "conv_decode")?,
             copy_pipeline: pipeline(&device, &library, "copy_f32")?,
             kv_write_pipeline: pipeline(&device, &library, "kv_write")?,
             queue: device.new_command_queue(),
@@ -464,9 +520,13 @@ impl Metal {
                 offset: 0,
                 out_dim: 0,
                 in_dim: 0,
-            }; 7];
+            }; 9];
             for proj in Proj::ALL {
-                let matrix = proj.matrix(layer);
+                // Layers only widen what they carry: attention layers skip the
+                // conv pair, conv layers skip the attention set.
+                let Some(matrix) = proj.matrix_opt(layer) else {
+                    continue;
+                };
                 let offset = flat.len();
                 flat.extend_from_slice(&matrix.to_bf16_bits());
                 layouts[proj.index()] = Layout {
@@ -547,10 +607,7 @@ impl Backend for Metal {
     }
 
     fn storage(&self) -> &'static str {
-        self.weights()
-            .layers
-            .first()
-            .map_or("f32", |layer| layer.wq.kind())
+        self.weights().token_embedding.kind()
     }
 
     fn prepare(&mut self, weights: Arc<ModelWeights>, kv: KvSpec) {
@@ -914,6 +971,74 @@ impl Backend for Metal {
         });
     }
 
+    fn mul(
+        &mut self,
+        out: Buf,
+        out_off: usize,
+        a: Buf,
+        a_off: usize,
+        b: Buf,
+        b_off: usize,
+        len: usize,
+    ) {
+        let o = self.buf(out);
+        let ab = self.buf(a);
+        let bb = self.buf(b);
+        let (oo, ao, bo, n) = (out_off as u32, a_off as u32, b_off as u32, len as u32);
+        let pipeline = self.mul_pipeline.clone();
+        self.encode(move |enc| {
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(0, Some(&o), 0);
+            enc.set_buffer(1, Some(&ab), 0);
+            enc.set_buffer(2, Some(&bb), 0);
+            enc.set_bytes(3, 4, &oo as *const u32 as *const _);
+            enc.set_bytes(4, 4, &ao as *const u32 as *const _);
+            enc.set_bytes(5, 4, &bo as *const u32 as *const _);
+            enc.set_bytes(6, 4, &n as *const u32 as *const _);
+            enc.dispatch_threads(MTLSize::new(len as u64, 1, 1), MTLSize::new(64, 1, 1));
+        });
+    }
+
+    fn conv_prefill(&mut self, out: Buf, x: Buf, kernel: Buf, rows: usize, dim: usize, k: usize) {
+        let o = self.buf(out);
+        let xb = self.buf(x);
+        let kb = self.buf(kernel);
+        let (d, r, kk) = (dim as u32, rows as u32, k as u32);
+        let pipeline = self.conv_prefill_pipeline.clone();
+        self.encode(move |enc| {
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(0, Some(&o), 0);
+            enc.set_buffer(1, Some(&xb), 0);
+            enc.set_buffer(2, Some(&kb), 0);
+            enc.set_bytes(3, 4, &d as *const u32 as *const _);
+            enc.set_bytes(4, 4, &r as *const u32 as *const _);
+            enc.set_bytes(5, 4, &kk as *const u32 as *const _);
+            enc.dispatch_threads(
+                MTLSize::new(dim as u64, rows as u64, 1),
+                MTLSize::new(32, 8, 1),
+            );
+        });
+    }
+
+    fn conv_decode(&mut self, out: Buf, x: Buf, kernel: Buf, state: Buf, dim: usize, k: usize) {
+        let o = self.buf(out);
+        let xb = self.buf(x);
+        let kb = self.buf(kernel);
+        let st = self.buf(state);
+        let (d, kk) = (dim as u32, k as u32);
+        let pipeline = self.conv_decode_pipeline.clone();
+        self.encode(move |enc| {
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(0, Some(&o), 0);
+            enc.set_buffer(1, Some(&xb), 0);
+            enc.set_buffer(2, Some(&kb), 0);
+            enc.set_buffer(3, Some(&st), 0);
+            enc.set_bytes(4, 4, &d as *const u32 as *const _);
+            enc.set_bytes(5, 4, &kk as *const u32 as *const _);
+            enc.dispatch_threads(MTLSize::new(dim as u64, 1, 1), MTLSize::new(64, 1, 1));
+        });
+    }
+
     fn logits(&mut self, x: Buf, y: Buf) {
         let layout = self.classifier;
         self.dispatch(layout, x, y, 1);
@@ -1051,5 +1176,56 @@ mod tests {
         let mut got = vec![0.0; 2];
         m.read(d, &mut got);
         assert_eq!(got, vec![11.0, 22.0], "add");
+
+        // mul with offsets, including same-buffer operands
+        let ab = m.upload(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let o = m.alloc(2);
+        m.mul(o, 0, ab, 1, ab, 3, 2);
+        let mut got = vec![0.0; 2];
+        m.read(o, &mut got);
+        assert_eq!(got, vec![2.0 * 4.0, 3.0 * 5.0], "mul offsets");
+
+        // conv_prefill against a hand computation, dim 4, k 3, rows 4.
+        // Row r sees max(0, r-2)..=r, zero-padded below row 0.
+        let x: Vec<f32> = (0..16).map(|i| i as f32 + 1.0).collect();
+        let kw: Vec<f32> = vec![
+            1.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, //
+            0.0, 0.0, 1.0, //
+            1.0, 1.0, 1.0, //
+        ];
+        let xb = m.upload(&x);
+        let kb = m.upload(&kw);
+        let co = m.alloc(16);
+        m.conv_prefill(co, xb, kb, 4, 4, 3);
+        let mut got = vec![0.0; 16];
+        m.read(co, &mut got);
+        // Lane 0 keeps tap 0: rows see x[r-2], x[r-1]... vs zero pad.
+        assert_eq!(got[0], 0.0, "conv pad row 0");
+        assert_eq!(got[4], 0.0, "conv pad row 1 lane 0");
+        assert_eq!(got[8], x[0], "conv row 2 lane 0");
+        assert_eq!(got[12], x[4], "conv row 3 lane 0");
+        // Lane 3 sums all three taps.
+        assert_eq!(got[3], x[3] + 0.0 + 0.0, "conv row 0 lane 3");
+        assert_eq!(got[15], x[7] + x[11] + x[15], "conv row 3 lane 3");
+
+        // conv_decode: history [r0, r1] plus x, then the ring advances.
+        let st = m.upload(&[10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]);
+        let xr = m.upload(&[1.0f32, 1.0, 1.0, 1.0]);
+        let orow = m.alloc(4);
+        m.conv_decode(orow, xr, kb, st, 4, 3);
+        let mut got = vec![0.0; 4];
+        m.read(orow, &mut got);
+        // Lane 0 (tap 0): state row 0 lane 0 (10). Lane 3 (all taps):
+        // state row 0 lane 3 (40) + state row 1 lane 3 (80) + x lane 3 (1).
+        assert_eq!(got[0], 10.0, "decode lane 0");
+        assert_eq!(got[3], 40.0 + 80.0 + 1.0, "decode lane 3");
+        let mut ring = vec![0.0; 8];
+        m.read(st, &mut ring);
+        assert_eq!(
+            ring,
+            vec![50.0, 60.0, 70.0, 80.0, 1.0, 1.0, 1.0, 1.0],
+            "ring advances"
+        );
     }
 }

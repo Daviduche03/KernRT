@@ -80,10 +80,10 @@ fn weights_at(config: &Config, storage: &str) -> ModelWeights {
             let s = 100 * (l as u64 + 1);
             LayerWeights {
                 rms_att: vector(dim, s + 1),
-                wq: cast(matrix(q_dim, dim, s + 2)),
-                wk: cast(matrix(kv_dim, dim, s + 3)),
-                wv: cast(matrix(kv_dim, dim, s + 4)),
-                wo: cast(matrix(dim, q_dim, s + 5)),
+                wq: Some(cast(matrix(q_dim, dim, s + 2))),
+                wk: Some(cast(matrix(kv_dim, dim, s + 3))),
+                wv: Some(cast(matrix(kv_dim, dim, s + 4))),
+                wo: Some(cast(matrix(dim, q_dim, s + 5))),
                 rms_ffn: vector(dim, s + 6),
                 w1: cast(matrix(hidden, dim, s + 7)),
                 w2: cast(matrix(dim, hidden, s + 8)),
@@ -91,6 +91,10 @@ fn weights_at(config: &Config, storage: &str) -> ModelWeights {
                 // Exercise the Qwen3 per-head norm path on both backends.
                 rms_q: Some(vector(config.head_dim, s + 10)),
                 rms_k: Some(vector(config.head_dim, s + 11)),
+                conv_in: None,
+                conv_out: None,
+                conv_kernel: None,
+                is_attention: true,
             }
         })
         .collect();

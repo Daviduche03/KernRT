@@ -8,7 +8,7 @@ use std::ops::ControlFlow;
 use std::sync::Mutex;
 
 use crate::arch::decision::{DecisionModel, QuestionType};
-use crate::arch::llm::{Llama, LoadError};
+use crate::arch::llm::{LanguageModel, LoadError};
 use crate::arch::vision::yolo26::{Detection, Yolo26};
 use crate::generate::{Sampler, generate_streaming};
 use crate::tokenizer::BpeTokenizer;
@@ -153,21 +153,22 @@ fn decide_error(error: LoadError) -> ServeError {
     }
 }
 
-/// Serves a [`Llama`] decoder over raw prompts and chat messages.
+/// Serves a decoder over raw prompts and chat messages, whichever family it
+/// belongs to (Llama, LFM2, or anything else implementing [`LanguageModel`]).
 ///
 /// The model sits behind a lock because decoding owns the key/value cache.
 /// The lock is uncontended while a single request runs.
-pub struct LlamaGenerate {
+pub struct LlmGenerate<M> {
     id: String,
-    model: Mutex<Llama>,
+    model: Mutex<M>,
     tokenizer: BpeTokenizer,
     template: Option<ChatTemplate>,
 }
 
-impl LlamaGenerate {
+impl<M: LanguageModel + Send> LlmGenerate<M> {
     pub fn new(
         id: impl Into<String>,
-        model: Llama,
+        model: M,
         tokenizer: BpeTokenizer,
         template: Option<ChatTemplate>,
     ) -> Self {
@@ -188,7 +189,7 @@ impl LlamaGenerate {
     }
 }
 
-impl Generate for LlamaGenerate {
+impl<M: LanguageModel + Send> Generate for LlmGenerate<M> {
     fn id(&self) -> &str {
         &self.id
     }

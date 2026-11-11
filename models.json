@@ -14,6 +14,19 @@
         },
         "generation_prompt": "Assistant:"
       }
+    },
+    {
+      "id": "lfm2-350m",
+      "kind": "generate",
+      "path": "target/lfm2_350m",
+      "chat_template": {
+        "message": {
+          "system": "<|startoftext|><|im_start|>system\n{content}<|im_end|>\n",
+          "user": "<|im_start|>user\n{content}<|im_end|>\n",
+          "assistant": "<|im_start|>assistant\n{content}<|im_end|>\n"
+        },
+        "generation_prompt": "<|im_start|>assistant\n"
+      }
     }
   ]
 }

@@ -162,6 +162,12 @@ One process, one port, two API surfaces: OpenAI chat/completions for text
 models, and a typed JSON API for what does not fit it (`POST /infer` for
 detections, `POST /decide` for decision heads). See `src/serve/mod.rs`.
 
+A `generate` entry loads whichever decoder the checkpoint declares: LFM2
+directories (`"model_type": "lfm2"`) run the hybrid path with the
+checkpoint's `eos_token_id` as the stop token, everything else loads as
+Llama. The shipped `models.json` serves `smollm2` and `lfm2-350m` side by
+side; `?model=<id>` (or the OpenAI `model` field) selects between them.
+
 ## What this is not
 
 * **Not a serving system.** One sequence at a time: there is no continuous

@@ -311,14 +311,21 @@ fn the_shipped_manifest_parses() {
             ("yolo26n", "detect"),
             ("jev", "decide"),
             ("smollm2", "generate"),
+            ("lfm2-350m", "generate"),
         ],
         "one of every kind, so the demo exercises all three routes"
     );
-    let chat = manifest.models.last().expect("smollm2 is listed");
-    assert!(
-        chat.chat_template.is_some(),
-        "without a template /v1/chat/completions cannot answer"
-    );
+    for id in ["smollm2", "lfm2-350m"] {
+        let entry = manifest
+            .models
+            .iter()
+            .find(|entry| entry.id == id)
+            .expect("listed above");
+        assert!(
+            entry.chat_template.is_some(),
+            "{id} needs a template or /v1/chat/completions cannot answer"
+        );
+    }
 }
 
 /// A one-pixel PNG: decoded, stretched to the model's 2x2, then detected.

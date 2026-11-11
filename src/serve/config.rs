@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use super::Registry;
-use super::adapters::{LlamaGenerate, NanoJevDecide, YoloDetect};
+use super::adapters::{LlmGenerate, NanoJevDecide, YoloDetect};
 use super::error::ServeError;
 use super::model::{ChatMessage, Model, Role};
 use crate::arch::decision::DecisionModel;
-use crate::arch::llm::Llama;
+use crate::arch::llm::{Lfm2, Llama};
 use crate::arch::vision::yolo26::Yolo26;
 use crate::tokenizer::BpeTokenizer;
 
@@ -185,6 +185,32 @@ impl Manifest {
     }
 }
 
+/// Which decoder architecture a checkpoint directory holds.
+///
+/// LFM2 checkpoints declare `"model_type": "lfm2"`; anything else — or an
+/// unreadable config — loads as Llama, which is what every existing manifest
+/// entry is. Reading the config here (rather than failing inside the loader)
+/// keeps a mislabelled entry's error about the weights, not the sniffing.
+fn is_lfm2(dir: &Path) -> bool {
+    config_value(dir, "model_type").is_some_and(|kind| kind == "lfm2")
+}
+
+/// The stop token a checkpoint declares, if any.
+fn lfm2_eos(dir: &Path) -> Option<usize> {
+    config_value(dir, "eos_token_id")?
+        .as_u64()
+        .map(|v| v as usize)
+}
+
+/// One string or integer field out of a checkpoint's `config.json`.
+fn config_value(dir: &Path, key: &str) -> Option<serde_json::Value> {
+    let bytes = std::fs::read(dir.join("config.json")).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()?
+        .get(key)
+        .cloned()
+}
+
 impl Entry {
     fn load(&self) -> Result<Model, ServeError> {
         let id = &self.id;
@@ -225,22 +251,42 @@ impl Entry {
                         .map_err(|error| ServeError::bad_request(format!("{id}: {error}")))?,
                     None => crate::backends::from_env(),
                 };
-                let model = Llama::from_hf_with(&self.path, backend).map_err(|error| {
-                    ServeError::internal(format!("{id}: cannot load language model: {error}"))
-                })?;
                 let tokenizer_path = self.path.join("tokenizer.json");
-                let tokenizer = BpeTokenizer::load(&tokenizer_path).map_err(|error| {
+                let mut tokenizer = BpeTokenizer::load(&tokenizer_path).map_err(|error| {
                     ServeError::internal(format!(
                         "{id}: cannot load {}: {error}",
                         tokenizer_path.display()
                     ))
                 })?;
-                Ok(Model::generate(LlamaGenerate::new(
-                    id.clone(),
-                    model,
-                    tokenizer,
-                    self.chat_template.clone(),
-                )))
+                // LFM2 checkpoints declare `"model_type": "lfm2"`; anything
+                // else (or an unreadable config) loads as Llama, which is what
+                // every existing manifest entry is.
+                if is_lfm2(&self.path) {
+                    // The checkpoint's `eos_token_id` is authoritative;
+                    // tokenizer.json carries no top-level eos field.
+                    if let Some(eos) = lfm2_eos(&self.path) {
+                        tokenizer.set_eos(eos);
+                    }
+                    let model = Lfm2::from_hf_with(&self.path, backend).map_err(|error| {
+                        ServeError::internal(format!("{id}: cannot load language model: {error}"))
+                    })?;
+                    Ok(Model::generate(LlmGenerate::new(
+                        id.clone(),
+                        model,
+                        tokenizer,
+                        self.chat_template.clone(),
+                    )))
+                } else {
+                    let model = Llama::from_hf_with(&self.path, backend).map_err(|error| {
+                        ServeError::internal(format!("{id}: cannot load language model: {error}"))
+                    })?;
+                    Ok(Model::generate(LlmGenerate::new(
+                        id.clone(),
+                        model,
+                        tokenizer,
+                        self.chat_template.clone(),
+                    )))
+                }
             }
             other => Err(ServeError::bad_request(format!(
                 "unknown model kind {other:?} for {id:?}; expected detect, decide or generate"
@@ -301,6 +347,41 @@ mod tests {
                 .message(),
             "manifest lists no models"
         );
+    }
+
+    /// `model_type` selects the decoder: `lfm2` loads the hybrid path,
+    /// anything else (including an unreadable config) loads as Llama.
+    #[test]
+    fn model_type_selects_the_decoder_architecture() {
+        let directory = std::env::temp_dir().join(format!("kernrt-arch-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config = |body: &str| {
+            std::fs::write(directory.join("config.json"), body).unwrap();
+            is_lfm2(&directory)
+        };
+        assert!(config(r#"{"model_type":"lfm2"}"#));
+        assert!(!config(r#"{"model_type":"llama"}"#));
+        assert!(!config(r#"{"model_type":"qwen3"}"#));
+        assert!(!config("{}"), "no model_type reads as Llama");
+        std::fs::remove_file(directory.join("config.json")).unwrap();
+        assert!(
+            !is_lfm2(&directory),
+            "an unreadable config reads as Llama; the loader reports the real error"
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// The stop token comes from the checkpoint, not the tokenizer: LFM2's
+    /// tokenizer.json carries no top-level eos field.
+    #[test]
+    fn eos_comes_from_the_checkpoint() {
+        let directory = std::env::temp_dir().join(format!("kernrt-eos-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("config.json"), r#"{"eos_token_id":7}"#).unwrap();
+        assert_eq!(lfm2_eos(&directory), Some(7));
+        std::fs::remove_file(directory.join("config.json")).unwrap();
+        assert_eq!(lfm2_eos(&directory), None);
+        std::fs::remove_dir_all(&directory).ok();
     }
 
     #[test]

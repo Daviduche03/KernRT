@@ -188,6 +188,35 @@ impl Q8_0x4 {
         }
         out
     }
+
+    /// De-interleave into row-major Q8_0 blocks: `out_dim * in_dim` int8
+    /// values plus one f32 scale per 32-element block, row by row.
+    ///
+    /// Byte-identical quants to the packed form; the f16 scales widen exactly.
+    /// The device backends consume this so one kernel family serves both the
+    /// row-major and the interleaved host layout.
+    pub(crate) fn to_row_major(&self) -> (Vec<i8>, Vec<f32>) {
+        let blocks = self.in_dim / Q8_0_BLOCK;
+        let mut quants = vec![0i8; self.out_dim * self.in_dim];
+        let mut scales = vec![0.0f32; self.out_dim * blocks];
+        for group in 0..self.out_dim / Q8_0X4_ROWS {
+            for block in 0..blocks {
+                let packed = &self.blocks[group * blocks + block];
+                for row_in_group in 0..Q8_0X4_ROWS {
+                    let row = group * Q8_0X4_ROWS + row_in_group;
+                    scales[row * blocks + block] = f16_scale_to_f32(packed.scales[row_in_group]);
+                    let dst = &mut quants[row * self.in_dim + block * Q8_0_BLOCK..][..Q8_0_BLOCK];
+                    for segment in 0..8 {
+                        for lane in 0..4 {
+                            dst[segment * 4 + lane] =
+                                packed.quants[segment * 16 + row_in_group * 4 + lane];
+                        }
+                    }
+                }
+            }
+        }
+        (quants, scales)
+    }
 }
 
 /// GEMV for the four-row-interleaved Q8_0 layout.
@@ -602,6 +631,23 @@ impl Matrix {
                 }
                 bits
             }
+        }
+    }
+
+    /// The whole matrix as row-major Q8_0 blocks: `out_dim * in_dim` int8
+    /// values plus one f32 scale per 32-element block, row by row.
+    ///
+    /// This is the device backends' canonical quantized layout: whatever the
+    /// host stores (`Q8_0` or the four-row-interleaved `Q8_0x4`), the device
+    /// reads the same logical blocks, so one kernel family serves both. The
+    /// repack is lossless — the same quants, with the f16 x4 scales widened
+    /// exactly — and `None` for non-quantized storages, which keep their own
+    /// path.
+    pub fn to_q8_row_major(&self) -> Option<(Vec<i8>, Vec<f32>)> {
+        match self {
+            Matrix::Q8_0 { scales, quants, .. } => Some((quants.clone(), scales.clone())),
+            Matrix::Q8_0x4(packed) => Some(packed.to_row_major()),
+            _ => None,
         }
     }
 

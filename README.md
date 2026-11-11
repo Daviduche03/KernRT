@@ -52,22 +52,24 @@ on 350M (cosine 0.99991, exact argmax and top-5):
 
 Prefill, 128 tokens (tok/s):
 
-| model | CPU bf16 | CPU q8_0x4 | Metal |
-|---|---|---|---|
-| LFM2-350M | 749 | 303 | 789 |
-| LFM2-700M | 28¹ | 146 | 386 |
+| model | CPU bf16 | CPU q8_0x4 | Metal bf16 | Metal q8_0x4 |
+|---|---|---|---|---|
+| LFM2-350M | 751 | 303 | 785 | 904 |
+| LFM2-700M | 28¹ | 144 | 387 | 456 |
 
 Decode, one token (tok/s):
 
-| model | CPU bf16 | CPU q8_0x4 | Metal |
-|---|---|---|---|
-| LFM2-350M | 26.6 | 143.5 | 37.7 |
-| LFM2-700M | 24.8 | 67.7 | 20.2 |
+| model | CPU bf16 | CPU q8_0x4 | Metal bf16 | Metal q8_0x4 |
+|---|---|---|---|---|
+| LFM2-350M | 26.5 | 132 | 38.0 | 52.6 |
+| LFM2-700M | 24.8 | 68.1 | 20.6 | 29.4 |
 
 ¹ 700M bf16 prefill trips the 2 GB widen budget and falls back to the
 row-at-a-time loop; `KERNRT_PREFILL_F32=1` forces the f32 copy and reaches
-402 tok/s on CPU. Metal stores bf16 regardless of the requested storage, so
-its bf16 and q8_0x4 columns match by construction.
+402 tok/s on CPU. Metal keeps its own copy of the weights: bf16 at half
+width, or native Q8 (int8 + f32 scales) with f32 activations, so its q8
+path is a different arithmetic from the CPU's integer one — validated
+against the scalar oracle (cosine, same argmax), not bit-identical.
 
 ## Quick start
 

@@ -317,6 +317,25 @@ pub trait Backend: Send {
     /// `y[rows, out] = x[rows, in] * w[out, in]^T` for one layer's projection.
     fn project(&mut self, layer: usize, proj: Proj, x: Buf, y: Buf, rows: usize);
 
+    /// Q, K and V in one call. The default is three `project` calls, which is
+    /// exactly what the driver did before; a backend that can cover all three
+    /// rows in one dispatch (one grid over q+kv+kv rows, one synchronisation)
+    /// overrides this. Decode is a long chain of tiny projections where each
+    /// dispatch costs about the same regardless of size, so this is where the
+    /// per-token launch count is cut.
+    fn project_qkv(&mut self, layer: usize, x: Buf, q: Buf, k: Buf, v: Buf, rows: usize) {
+        self.project(layer, Proj::Q, x, q, rows);
+        self.project(layer, Proj::K, x, k, rows);
+        self.project(layer, Proj::V, x, v, rows);
+    }
+
+    /// Gate and up projections in one call, same arrangement as
+    /// [`project_qkv`](Self::project_qkv).
+    fn project_gate_up(&mut self, layer: usize, x: Buf, gate: Buf, up: Buf, rows: usize) {
+        self.project(layer, Proj::Gate, x, gate, rows);
+        self.project(layer, Proj::Up, x, up, rows);
+    }
+
     /// Write `rows` key/value rows into the cache, `slots[i]` for row `i`.
     ///
     /// Batched rather than one call per row: at 128 prompt tokens over 30

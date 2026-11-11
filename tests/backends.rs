@@ -379,6 +379,52 @@ fn metal_matches_the_scalar_oracle() {
     );
 }
 
+/// The GPU's quantized path against the scalar oracle.
+///
+/// Metal keeps f32 activations and dequantizes weights on the fly, while the
+/// reference quantizes the activation too — so this checks agreement rather
+/// than bit-equality: cosine near 1 and the same argmax, the same standard
+/// the f32-prefill oracle test uses for a different arithmetic.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_q8_matches_the_scalar_oracle() {
+    if let Err(error) = kernrt::backends::open("metal") {
+        assert!(
+            error.to_string().contains("no Metal device"),
+            "Metal is present but failed to start: {error}"
+        );
+        eprintln!("skipping: no Metal device available");
+        return;
+    }
+    let build = |name: &str| {
+        Llama::with_backend(
+            config(),
+            weights_at(&config(), "q8_0x4"),
+            kernrt::backends::open(name).unwrap(),
+        )
+    };
+    let prompt: Vec<usize> = vec![5, 11, 2, 30, 7, 7, 19, 1, 24];
+    let mut gpu = build("metal");
+    let mut oracle = build("reference");
+    let mut want = Vec::new();
+    for (pos, &token) in prompt.iter().enumerate() {
+        let a = gpu.forward(token, pos).to_vec();
+        want = oracle.forward(token, pos).to_vec();
+        let diff = max_diff(&a, &want);
+        assert!(diff <= 5e-2, "q8 decode differs at {pos} by {diff}");
+        assert_eq!(argmax(&a), argmax(&want), "different token at {pos}");
+    }
+
+    let got = gpu.prefill(&prompt, 0).to_vec();
+    let diff = max_diff(&got, &want);
+    assert!(diff <= 5e-2, "q8 prefill differs from decode by {diff}");
+    assert_eq!(
+        argmax(&got),
+        argmax(&want),
+        "q8 prefill picked a different token"
+    );
+}
+
 /// Tiles larger than one threadgroup, in both dimensions.
 ///
 /// The small model above puts every projection inside a single 64x64 tile, so

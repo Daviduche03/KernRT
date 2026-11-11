@@ -422,9 +422,7 @@ impl Lfm2 {
             backend.rms_norm(state.xb, state.x, n.op, 1, dim, eps);
 
             if *attn {
-                backend.project(l, Proj::Q, state.xb, state.q, 1);
-                backend.project(l, Proj::K, state.xb, state.k, 1);
-                backend.project(l, Proj::V, state.xb, state.v, 1);
+                backend.project_qkv(l, state.xb, state.q, state.k, state.v, 1);
 
                 // LFM2 normalises q and k per head on every attention layer.
                 if let Some(w) = n.q {
@@ -466,8 +464,7 @@ impl Lfm2 {
 
             // Feed-forward RMSNorm, then the gated MLP.
             backend.rms_norm(state.xb, state.x, n.ffn, 1, dim, eps);
-            backend.project(l, Proj::Gate, state.xb, state.gate, 1);
-            backend.project(l, Proj::Up, state.xb, state.up, 1);
+            backend.project_gate_up(l, state.xb, state.gate, state.up, 1);
             backend.silu_mul(state.gate, state.up, hidden);
             backend.project(l, Proj::Down, state.gate, state.mlp, 1);
             backend.add_in_place(state.x, state.mlp, dim);
@@ -568,9 +565,7 @@ impl Lfm2 {
             backend.rms_norm(pb.xb, pb.x, n.op, n_tok, dim, eps);
 
             if *attn {
-                backend.project(l, Proj::Q, pb.xb, pb.q, n_tok);
-                backend.project(l, Proj::K, pb.xb, pb.k, n_tok);
-                backend.project(l, Proj::V, pb.xb, pb.v, n_tok);
+                backend.project_qkv(l, pb.xb, pb.q, pb.k, pb.v, n_tok);
 
                 if let Some(w) = n.q {
                     backend.qk_norm(pb.q, n_tok, q_dim, head_size, w, eps);
@@ -630,8 +625,7 @@ impl Lfm2 {
             }
 
             backend.rms_norm(pb.xb, pb.x, n.ffn, n_tok, dim, eps);
-            backend.project(l, Proj::Gate, pb.xb, pb.gate, n_tok);
-            backend.project(l, Proj::Up, pb.xb, pb.up, n_tok);
+            backend.project_gate_up(l, pb.xb, pb.gate, pb.up, n_tok);
             backend.silu_mul(pb.gate, pb.up, n_tok * hidden);
             backend.project(l, Proj::Down, pb.gate, pb.o, n_tok);
             backend.add_in_place(pb.x, pb.o, n_tok * dim);

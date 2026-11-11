@@ -25,6 +25,7 @@ use metal::{
 };
 
 use super::{AttnSpec, Backend, Buf, KvSpec, ModelWeights, Proj, RopeSpec, Window};
+use crate::formats::llama2c::LayerWeights;
 
 /// Output tile per threadgroup for the batched path: 16x16 threads, 4x4 each.
 const BLOCK_M: u64 = 64;
@@ -325,7 +326,366 @@ kernel void silu_mul(device float* g         [[buffer(0)]],
     if (i < n) g[i] = (g[i] / (1.0f + exp(-g[i]))) * u[i];
 }
 
-// out[i] = a[a_off + i] * b[b_off + i]. Offsets are element counts.
+// y = W x with row-major Q8_0 blocks: 32 int8 + one f32 scale per block.
+// Activations stay f32 — only the weights are quantized, so unlike the CPU
+// integer path there is no activation quantization error. One thread per row.
+kernel void gemv_q8(device const char* w    [[buffer(0)]],
+                    device const float* s   [[buffer(1)]],
+                    device const float* x   [[buffer(2)]],
+                    device float* out       [[buffer(3)]],
+                    constant uint& n        [[buffer(4)]],
+                    constant uint& k        [[buffer(5)]],
+                    constant uint& nb       [[buffer(6)]],
+                    uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) return;
+    device const char* wp = w + gid * k;
+    device const float* sp = s + gid * nb;
+    float acc = 0.0f;
+    for (uint b = 0; b < nb; ++b) {
+        float sum = 0.0f;
+        for (uint i = 0; i < 32; ++i) {
+            sum = fma(float(wp[b * 32 + i]), x[b * 32 + i], sum);
+        }
+        acc = fma(sp[b], sum, acc);
+    }
+    // Rows are block-aligned on every quantized model the loader accepts, so
+    // there is no tail: k is a whole number of blocks by construction.
+    out[gid] = acc;
+}
+
+// Batched Q8_0 GEMM: c[m, n] = a[m, k] * w[n, k]^T with the same row-major
+// blocks. Same 64x64 output tile and 4x4 register block as `gemm_nt`, but
+// the k step is one 16-wide slice of a 32-wide block: tile t of output row r
+// reads exactly one scale, s[r * nb + t / 2]. Activations stay f32.
+kernel void gemm_q8(device const float* a   [[buffer(0)]],
+                    device const char* b    [[buffer(1)]],
+                    device const float* s   [[buffer(2)]],
+                    device float* out       [[buffer(3)]],
+                    constant uint& m        [[buffer(4)]],
+                    constant uint& n        [[buffer(5)]],
+                    constant uint& k        [[buffer(6)]],
+                    constant uint& nb       [[buffer(7)]],
+                    uint2 tid [[thread_position_in_threadgroup]],
+                    uint2 bid [[threadgroup_position_in_grid]]) {
+    threadgroup float ash[BM][BK];
+    threadgroup char bsh[BN][BK];
+
+    uint row0 = bid.y * BM + tid.y * TM;
+    uint col0 = bid.x * BN + tid.x * TN;
+
+    float acc[TM][TN];
+    for (uint r = 0; r < TM; ++r)
+        for (uint c = 0; c < TN; ++c) acc[r][c] = 0.0f;
+
+    uint full = k / BK;
+    for (uint t = 0; t < full; ++t) {
+        for (uint s = 0; s < 4; ++s) {
+            uint idx = tid.y * TILE + tid.x + s * 256;
+            uint r = idx >> 4;
+            uint kk = idx & (BK - 1);
+            uint gr = min(bid.y * BM + r, m - 1);
+            uint gc = min(bid.x * BN + r, n - 1);
+            ash[r][kk] = a[gr * k + t * BK + kk];
+            bsh[r][kk] = b[gc * k + t * BK + kk];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float bacc[TM][TN];
+        for (uint r = 0; r < TM; ++r)
+            for (uint c = 0; c < TN; ++c) bacc[r][c] = 0.0f;
+        for (uint i = 0; i < BK; ++i) {
+            float av[TM], bv[TN];
+            for (uint r = 0; r < TM; ++r) av[r] = ash[tid.y * TM + r][i];
+            for (uint c = 0; c < TN; ++c) bv[c] = float(bsh[tid.x * TN + c][i]);
+            for (uint r = 0; r < TM; ++r)
+                for (uint c = 0; c < TN; ++c)
+                    bacc[r][c] = fma(av[r], bv[c], bacc[r][c]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // One scale per output column for this tile: tile t covers k
+        // [t*16, t*16+16), which lies inside block t/2. The scale belongs to
+        // the weight row, i.e. the output column — not the output row.
+        for (uint c = 0; c < TN; ++c) {
+            uint gcol = col0 + c;
+            float sc = (gcol < n) ? s[gcol * nb + t / 2] : 0.0f;
+            for (uint r = 0; r < TM; ++r) acc[r][c] = fma(sc, bacc[r][c], acc[r][c]);
+        }
+    }
+
+    for (uint i = full * BK; i < k; ++i) {
+        uint blk = i >> 5;
+        for (uint r = 0; r < TM; ++r) {
+            uint grow = min(row0 + r, m - 1);
+            float av = a[grow * k + i];
+            for (uint c = 0; c < TN; ++c) {
+                uint gcol = min(col0 + c, n - 1);
+                float sc = (row0 + r < m && col0 + c < n && blk < nb) ? s[gcol * nb + blk] : 0.0f;
+                acc[r][c] = fma(sc * av, float(b[gcol * k + i]), acc[r][c]);
+            }
+        }
+    }
+
+    for (uint r = 0; r < TM; ++r) {
+        if (row0 + r >= m) break;
+        for (uint c = 0; c < TN; ++c) {
+            if (col0 + c >= n) break;
+            out[(row0 + r) * n + col0 + c] = acc[r][c];
+        }
+    }
+}
+
+// Fused QKV / GateUp decode: one thread per fused output row, routed to
+// one of three output buffers by row range. The slices are [n0 | n1 | n2]
+// rows wide (GateUp leaves n2 at zero). Same arithmetic as three GEMVs.
+kernel void gemv_qkv(device const ushort* w   [[buffer(0)]],
+                     device float* o0         [[buffer(1)]],
+                     device float* o1         [[buffer(2)]],
+                     device float* o2         [[buffer(3)]],
+                     device const float* x    [[buffer(4)]],
+                     constant uint& n0        [[buffer(5)]],
+                     constant uint& n1        [[buffer(6)]],
+                     constant uint& n2        [[buffer(7)]],
+                     constant uint& k         [[buffer(8)]],
+                     uint gid [[thread_position_in_grid]]) {
+    uint n = n0 + n1 + n2;
+    if (gid >= n) return;
+    uint row = gid;
+    uint base = 0;
+    device float* out = o0;
+    if (gid >= n0 + n1) {
+        out = o2;
+        row = gid - n0 - n1;
+        base = n0 + n1;
+    } else if (gid >= n0) {
+        out = o1;
+        row = gid - n0;
+        base = n0;
+    }
+    device const ushort* wp = w + (base + row) * k;
+    uint k4 = k >> 2;
+    device const float4* x4 = (device const float4*)x;
+    device const ushort4* w4 = (device const ushort4*)wp;
+    float4 acc = float4(0.0f);
+    for (uint i = 0; i < k4; ++i) {
+        float4 xv = x4[i];
+        ushort4 wv = w4[i];
+        acc.x = fma(bf16_to_f32(wv.x), xv.x, acc.x);
+        acc.y = fma(bf16_to_f32(wv.y), xv.y, acc.y);
+        acc.z = fma(bf16_to_f32(wv.z), xv.z, acc.z);
+        acc.w = fma(bf16_to_f32(wv.w), xv.w, acc.w);
+    }
+    float sum = acc.x + acc.y + acc.z + acc.w;
+    for (uint i = k4 << 2; i < k; ++i) sum = fma(bf16_to_f32(wp[i]), x[i], sum);
+    out[row] = sum;
+}
+
+// Fused Q8 QKV / GateUp decode: same routing, int8 weights widened on the
+// fly against the per-row f32 scales. Activations stay f32.
+kernel void gemv_q8_qkv(device const char* w    [[buffer(0)]],
+                        device const float* s   [[buffer(1)]],
+                        device float* o0        [[buffer(2)]],
+                        device float* o1        [[buffer(3)]],
+                        device float* o2        [[buffer(4)]],
+                        device const float* x   [[buffer(5)]],
+                        constant uint& n0       [[buffer(6)]],
+                        constant uint& n1       [[buffer(7)]],
+                        constant uint& n2       [[buffer(8)]],
+                        constant uint& k        [[buffer(9)]],
+                        constant uint& nb       [[buffer(10)]],
+                        uint gid [[thread_position_in_grid]]) {
+    uint n = n0 + n1 + n2;
+    if (gid >= n) return;
+    uint row = gid;
+    uint base = 0;
+    device float* out = o0;
+    if (gid >= n0 + n1) {
+        out = o2;
+        row = gid - n0 - n1;
+        base = n0 + n1;
+    } else if (gid >= n0) {
+        out = o1;
+        row = gid - n0;
+        base = n0;
+    }
+    device const char* wp = w + (base + row) * k;
+    device const float* sp = s + (base + row) * nb;
+    float acc = 0.0f;
+    for (uint b = 0; b < nb; ++b) {
+        float sum = 0.0f;
+        for (uint i = 0; i < 32; ++i) {
+            sum = fma(float(wp[b * 32 + i]), x[b * 32 + i], sum);
+        }
+        acc = fma(sp[b], sum, acc);
+    }
+    out[row] = acc;
+}
+
+// Fused QKV / GateUp prefill: the tiled GEMM over the fused row range,
+// routing each output column to its slice's buffer. Same tile geometry as
+// `gemm_nt`; the slice test is uniform inside a 64-wide tile whenever the
+// slice widths are multiples of 64, which holds for every model here.
+kernel void gemm_qkv(device const float* a   [[buffer(0)]],
+                     device const ushort* b  [[buffer(1)]],
+                     device float* o0        [[buffer(2)]],
+                     device float* o1        [[buffer(3)]],
+                     device float* o2        [[buffer(4)]],
+                     constant uint& m        [[buffer(5)]],
+                     constant uint& k        [[buffer(6)]],
+                     constant uint& n0       [[buffer(7)]],
+                     constant uint& n1       [[buffer(8)]],
+                     constant uint& n2       [[buffer(9)]],
+                     uint2 tid [[thread_position_in_threadgroup]],
+                     uint2 bid [[threadgroup_position_in_grid]]) {
+    uint nrows = n0 + n1 + n2;
+    uint row0 = bid.y * BM + tid.y * TM;
+    uint col0 = bid.x * BN + tid.x * TN;
+
+    threadgroup float ash[BM][BK];
+    threadgroup float bsh[BN][BK];
+
+    float acc[TM][TN];
+    for (uint r = 0; r < TM; ++r)
+        for (uint c = 0; c < TN; ++c) acc[r][c] = 0.0f;
+
+    uint full = k / BK;
+    for (uint t = 0; t < full; ++t) {
+        for (uint s = 0; s < 4; ++s) {
+            uint idx = tid.y * TILE + tid.x + s * 256;
+            uint r = idx >> 4;
+            uint kk = idx & (BK - 1);
+            uint gr = min(bid.y * BM + r, m - 1);
+            uint gc = min(bid.x * BN + r, nrows - 1);
+            ash[r][kk] = a[gr * k + t * BK + kk];
+            bsh[r][kk] = bf16_to_f32(b[gc * k + t * BK + kk]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < BK; ++i) {
+            float av[TM], bv[TN];
+            for (uint r = 0; r < TM; ++r) av[r] = ash[tid.y * TM + r][i];
+            for (uint c = 0; c < TN; ++c) bv[c] = bsh[tid.x * TN + c][i];
+            for (uint r = 0; r < TM; ++r)
+                for (uint c = 0; c < TN; ++c)
+                    acc[r][c] = fma(av[r], bv[c], acc[r][c]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = full * BK; i < k; ++i) {
+        for (uint r = 0; r < TM; ++r) {
+            float av = a[min(row0 + r, m - 1) * k + i];
+            for (uint c = 0; c < TN; ++c)
+                acc[r][c] = fma(av, bf16_to_f32(b[min(col0 + c, nrows - 1) * k + i]), acc[r][c]);
+        }
+    }
+
+    for (uint c = 0; c < TN; ++c) {
+        uint col = col0 + c;
+        if (col >= nrows) break;
+        device float* out;
+        uint o;
+        uint w;
+        if (col < n0) { out = o0; o = col; w = n0; }
+        else if (col < n0 + n1) { out = o1; o = col - n0; w = n1; }
+        else { out = o2; o = col - n0 - n1; w = n2; }
+        for (uint r = 0; r < TM; ++r) {
+            if (row0 + r >= m) break;
+            out[(row0 + r) * w + o] = acc[r][c];
+        }
+    }
+}
+
+// Fused Q8 QKV / GateUp prefill: tiled GEMM with per-(weight-row,
+// block) scales. Each output column belongs to exactly one weight row, which
+// selects both the output buffer and the scale row; the activation row never
+// does, which is the bug a first draft of this kernel had.
+kernel void gemm_q8_qkv(device const float* a   [[buffer(0)]],
+                        device const char* b    [[buffer(1)]],
+                        device const float* s   [[buffer(2)]],
+                        device float* o0        [[buffer(3)]],
+                        device float* o1        [[buffer(4)]],
+                        device float* o2        [[buffer(5)]],
+                        constant uint& m        [[buffer(6)]],
+                        constant uint& k        [[buffer(7)]],
+                        constant uint& nb       [[buffer(8)]],
+                        constant uint& n0       [[buffer(9)]],
+                        constant uint& n1       [[buffer(10)]],
+                        constant uint& n2       [[buffer(11)]],
+                        uint2 tid [[thread_position_in_threadgroup]],
+                        uint2 bid [[threadgroup_position_in_grid]]) {
+    uint nrows = n0 + n1 + n2;
+    uint row0 = bid.y * BM + tid.y * TM;
+    uint col0 = bid.x * BN + tid.x * TN;
+
+    threadgroup float ash[BM][BK];
+    threadgroup char bsh[BN][BK];
+
+    float acc[TM][TN];
+    for (uint r = 0; r < TM; ++r)
+        for (uint c = 0; c < TN; ++c) acc[r][c] = 0.0f;
+
+    uint full = k / BK;
+    for (uint t = 0; t < full; ++t) {
+        for (uint s = 0; s < 4; ++s) {
+            uint idx = tid.y * TILE + tid.x + s * 256;
+            uint r = idx >> 4;
+            uint kk = idx & (BK - 1);
+            uint gr = min(bid.y * BM + r, m - 1);
+            uint gc = min(bid.x * BN + r, nrows - 1);
+            ash[r][kk] = a[gr * k + t * BK + kk];
+            bsh[r][kk] = b[gc * k + t * BK + kk];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float bacc[TM][TN];
+        for (uint r = 0; r < TM; ++r)
+            for (uint c = 0; c < TN; ++c) bacc[r][c] = 0.0f;
+        for (uint i = 0; i < BK; ++i) {
+            float av[TM], bv[TN];
+            for (uint r = 0; r < TM; ++r) av[r] = ash[tid.y * TM + r][i];
+            for (uint c = 0; c < TN; ++c) bv[c] = float(bsh[tid.x * TN + c][i]);
+            for (uint r = 0; r < TM; ++r)
+                for (uint c = 0; c < TN; ++c)
+                    bacc[r][c] = fma(av[r], bv[c], bacc[r][c]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint c = 0; c < TN; ++c) {
+            uint col = col0 + c;
+            if (col >= nrows) break;
+            float sc = s[col * nb + t / 2];
+            for (uint r = 0; r < TM; ++r) {
+                if (row0 + r >= m) continue;
+                acc[r][c] = fma(sc, bacc[r][c], acc[r][c]);
+            }
+        }
+    }
+
+    for (uint i = full * BK; i < k; ++i) {
+        uint blk = i >> 5;
+        for (uint r = 0; r < TM; ++r) {
+            uint grow = min(row0 + r, m - 1);
+            float av = a[grow * k + i];
+            for (uint c = 0; c < TN; ++c) {
+                uint gcol = min(col0 + c, nrows - 1);
+                float sc = (row0 + r < m && col0 + c < nrows && blk < nb) ? s[gcol * nb + blk] : 0.0f;
+                acc[r][c] = fma(sc * av, float(b[gcol * k + i]), acc[r][c]);
+            }
+        }
+    }
+
+    for (uint c = 0; c < TN; ++c) {
+        uint col = col0 + c;
+        if (col >= nrows) break;
+        device float* out;
+        uint o;
+        uint w;
+        if (col < n0) { out = o0; o = col; w = n0; }
+        else if (col < n0 + n1) { out = o1; o = col - n0; w = n1; }
+        else { out = o2; o = col - n0 - n1; w = n2; }
+        for (uint r = 0; r < TM; ++r) {
+            if (row0 + r >= m) break;
+            out[(row0 + r) * w + o] = acc[r][c];
+        }
+    }
+}
+// out[i] = a[a_off + i] * b[b_off + i]. Offsets are element counts.// out[i] = a[a_off + i] * b[b_off + i]. Offsets are element counts.
 kernel void mul_offsets(device float* out       [[buffer(0)]],
                         device const float* a    [[buffer(1)]],
                         device const float* b    [[buffer(2)]],
@@ -381,6 +741,76 @@ struct Layout {
     offset: usize,
     out_dim: usize,
     in_dim: usize,
+    /// Byte offset into the packed int8 buffer, or `usize::MAX` when this
+    /// projection is not quantized on the device.
+    q_offset: usize,
+    /// Element offset into the f32 scale buffer (one scale per 32-wide block
+    /// per row); meaningless when `q_offset` is `usize::MAX`.
+    s_offset: usize,
+}
+
+impl Layout {
+    fn dense(offset: usize, out_dim: usize, in_dim: usize) -> Self {
+        Layout {
+            offset,
+            out_dim,
+            in_dim,
+            q_offset: usize::MAX,
+            s_offset: 0,
+        }
+    }
+
+    fn quantized(q_offset: usize, s_offset: usize, out_dim: usize, in_dim: usize) -> Self {
+        Layout {
+            // The bf16 copy is not built for quantized projections; keep the
+            // offset at zero rather than a dangling index into it.
+            offset: 0,
+            out_dim,
+            in_dim,
+            q_offset,
+            s_offset,
+        }
+    }
+
+    fn is_q8(&self) -> bool {
+        self.q_offset != usize::MAX
+    }
+}
+
+/// One fused QKV or GateUp projection: the row blocks each output owns.
+///
+/// A fused QKV covers `[q | k | v]` rows; a fused GateUp covers `[gate | up]`
+/// with an empty third slice. The weights live in one concatenated buffer —
+/// bf16 in [`Metal::weights`], or int8 plus f32 scales in
+/// [`Metal::qweights`]/[`Metal::qscales`] — and the kernel routes each output
+/// row to its slice. Keeping one kernel shape for both fusions halves the
+/// shader count.
+#[derive(Clone, Copy, Debug)]
+struct FusedLayout {
+    /// Element offset into the fused weight buffer (u16 for bf16, i8 for Q8).
+    w_offset: usize,
+    /// Element offset into the fused f32 scale buffer (Q8 only).
+    s_offset: usize,
+    /// Row counts of the three slices; the third is zero for GateUp.
+    n0: usize,
+    n1: usize,
+    n2: usize,
+    in_dim: usize,
+    is_q8: bool,
+}
+
+impl FusedLayout {
+    fn absent() -> Self {
+        FusedLayout {
+            w_offset: 0,
+            s_offset: 0,
+            n0: 0,
+            n1: 0,
+            n2: 0,
+            in_dim: 0,
+            is_q8: false,
+        }
+    }
 }
 
 pub struct Metal {
@@ -388,6 +818,12 @@ pub struct Metal {
     queue: CommandQueue,
     gemm_pipeline: ComputePipelineState,
     gemv_pipeline: ComputePipelineState,
+    gemm_q8_pipeline: ComputePipelineState,
+    gemv_q8_pipeline: ComputePipelineState,
+    gemm_qkv_pipeline: ComputePipelineState,
+    gemv_qkv_pipeline: ComputePipelineState,
+    gemm_q8_qkv_pipeline: ComputePipelineState,
+    gemv_q8_qkv_pipeline: ComputePipelineState,
     rms_pipeline: ComputePipelineState,
     qk_pipeline: ComputePipelineState,
     rope_half_pipeline: ComputePipelineState,
@@ -403,6 +839,17 @@ pub struct Metal {
     kv_write_pipeline: ComputePipelineState,
     /// Every projection of every layer plus the classifier, concatenated.
     weights: Buffer,
+    /// Packed int8 weights for quantized projections, row-major 32-wide
+    /// blocks, concatenated in the same order.
+    qweights: Buffer,
+    /// One f32 scale per block, concatenated in the same order.
+    qscales: Buffer,
+    /// Fused Q and GateUp weights: `[Q|K|V]` and `[gate|up]` rows concatenated
+    /// per layer, in `weights` (bf16) or `qweights`/`qscales` (Q8), with one
+    /// layout each. Attention layers carry both; convolution layers carry only
+    /// the GateUp half.
+    qkv: Vec<FusedLayout>,
+    gate_up: Vec<FusedLayout>,
     layers: Vec<[Layout; 9]>,
     classifier: Layout,
     weights_host: Option<Arc<ModelWeights>>,
@@ -444,6 +891,12 @@ impl Metal {
         Ok(Metal {
             gemm_pipeline: pipeline(&device, &library, "gemm_nt")?,
             gemv_pipeline: pipeline(&device, &library, "gemv")?,
+            gemm_q8_pipeline: pipeline(&device, &library, "gemm_q8")?,
+            gemv_q8_pipeline: pipeline(&device, &library, "gemv_q8")?,
+            gemm_qkv_pipeline: pipeline(&device, &library, "gemm_qkv")?,
+            gemv_qkv_pipeline: pipeline(&device, &library, "gemv_qkv")?,
+            gemm_q8_qkv_pipeline: pipeline(&device, &library, "gemm_q8_qkv")?,
+            gemv_q8_qkv_pipeline: pipeline(&device, &library, "gemv_q8_qkv")?,
             rms_pipeline: pipeline(&device, &library, "rms_norm")?,
             qk_pipeline: pipeline(&device, &library, "qk_norm")?,
             rope_half_pipeline: pipeline(&device, &library, "rope_half")?,
@@ -459,6 +912,8 @@ impl Metal {
             kv_write_pipeline: pipeline(&device, &library, "kv_write")?,
             queue: device.new_command_queue(),
             weights: placeholder.clone(),
+            qweights: placeholder.clone(),
+            qscales: placeholder.clone(),
             key_cache: placeholder.clone(),
             value_cache: placeholder.clone(),
             positions: placeholder.clone(),
@@ -472,11 +927,9 @@ impl Metal {
             },
             device,
             layers: Vec::new(),
-            classifier: Layout {
-                offset: 0,
-                out_dim: 0,
-                in_dim: 0,
-            },
+            classifier: Layout::dense(0, 0, 0),
+            qkv: Vec::new(),
+            gate_up: Vec::new(),
             weights_host: None,
             bufs: Vec::new(),
             command: None,
@@ -512,51 +965,232 @@ impl Metal {
         self.bufs[b.0].clone()
     }
 
+    /// Concatenate several projections' rows into the fused stores, in order.
+    ///
+    /// Returns the layout the fused kernels bind: bf16 rows appended to
+    /// `flat`, or int8 rows plus f32 scales appended to `qflat`/`sflat` when
+    /// the model is quantized. `FusedLayout::absent` when any piece is
+    /// missing (a convolution layer has no QKV triple); the driver never
+    /// dispatches those.
+    fn fuse_projs(
+        layer: &LayerWeights,
+        projs: &[Proj],
+        flat: &mut Vec<u16>,
+        qflat: &mut Vec<i8>,
+        sflat: &mut Vec<f32>,
+    ) -> FusedLayout {
+        let mut mats = Vec::with_capacity(projs.len());
+        for &proj in projs {
+            match proj.matrix_opt(layer) {
+                Some(m) => mats.push(m),
+                None => return FusedLayout::absent(),
+            }
+        }
+        let in_dim = mats[0].in_dim();
+        debug_assert!(mats.iter().all(|m| m.in_dim() == in_dim));
+        let mut rows = [0usize; 3];
+        for (i, m) in mats.iter().enumerate() {
+            rows[i] = m.out_dim();
+        }
+        if mats[0].to_q8_row_major().is_some() {
+            let w_offset = qflat.len();
+            let s_offset = sflat.len();
+            for m in mats {
+                let (quants, scales) = m.to_q8_row_major().expect("storage is uniform");
+                qflat.extend_from_slice(&quants);
+                sflat.extend_from_slice(&scales);
+            }
+            FusedLayout {
+                w_offset,
+                s_offset,
+                n0: rows[0],
+                n1: rows[1],
+                n2: rows[2],
+                in_dim,
+                is_q8: true,
+            }
+        } else {
+            let w_offset = flat.len();
+            for m in mats {
+                flat.extend_from_slice(&m.to_bf16_bits());
+            }
+            FusedLayout {
+                w_offset,
+                s_offset: 0,
+                n0: rows[0],
+                n1: rows[1],
+                n2: rows[2],
+                in_dim,
+                is_q8: false,
+            }
+        }
+    }
+
     fn upload_weights(&mut self, weights: &ModelWeights) {
         let mut flat: Vec<u16> = Vec::new();
+        let mut qflat: Vec<i8> = Vec::new();
+        let mut sflat: Vec<f32> = Vec::new();
         let mut layers = Vec::with_capacity(weights.layers.len());
+        let mut qkv = Vec::with_capacity(weights.layers.len());
+        let mut gate_up = Vec::with_capacity(weights.layers.len());
         for layer in &weights.layers {
-            let mut layouts = [Layout {
-                offset: 0,
-                out_dim: 0,
-                in_dim: 0,
-            }; 9];
+            let mut layouts = [Layout::dense(0, 0, 0); 9];
+            // Q/K/V and Gate/Up fuse into single dispatches; their rows live
+            // in the fused stores below, not in per-projection slots.
+            const FUSED: [Proj; 5] = [Proj::Q, Proj::K, Proj::V, Proj::Gate, Proj::Up];
             for proj in Proj::ALL {
+                if FUSED.contains(&proj) {
+                    continue;
+                }
                 // Layers only widen what they carry: attention layers skip the
                 // conv pair, conv layers skip the attention set.
                 let Some(matrix) = proj.matrix_opt(layer) else {
                     continue;
                 };
+                // Quantized projections keep no bf16 copy: the device reads
+                // the canonical row-major int8 blocks instead.
+                if let Some((quants, scales)) = matrix.to_q8_row_major() {
+                    let q_offset = qflat.len();
+                    let s_offset = sflat.len();
+                    qflat.extend_from_slice(&quants);
+                    sflat.extend_from_slice(&scales);
+                    layouts[proj.index()] =
+                        Layout::quantized(q_offset, s_offset, matrix.out_dim(), matrix.in_dim());
+                    continue;
+                }
                 let offset = flat.len();
                 flat.extend_from_slice(&matrix.to_bf16_bits());
-                layouts[proj.index()] = Layout {
-                    offset,
-                    out_dim: matrix.out_dim(),
-                    in_dim: matrix.in_dim(),
-                };
+                layouts[proj.index()] = Layout::dense(offset, matrix.out_dim(), matrix.in_dim());
             }
             layers.push(layouts);
+
+            // Fused QKV: [Q rows | K rows | V rows], attention layers only.
+            qkv.push(Self::fuse_projs(
+                layer,
+                &[Proj::Q, Proj::K, Proj::V],
+                &mut flat,
+                &mut qflat,
+                &mut sflat,
+            ));
+            // Fused GateUp: [gate rows | up rows]; every layer carries an MLP.
+            gate_up.push(Self::fuse_projs(
+                layer,
+                &[Proj::Gate, Proj::Up],
+                &mut flat,
+                &mut qflat,
+                &mut sflat,
+            ));
         }
         let classifier = weights.classifier();
-        let offset = flat.len();
-        flat.extend_from_slice(&classifier.to_bf16_bits());
-        let classifier_layout = Layout {
-            offset,
-            out_dim: classifier.out_dim(),
-            in_dim: classifier.in_dim(),
+        let classifier_layout = if let Some((quants, scales)) = classifier.to_q8_row_major() {
+            let layout = Layout::quantized(
+                qflat.len(),
+                sflat.len(),
+                classifier.out_dim(),
+                classifier.in_dim(),
+            );
+            qflat.extend_from_slice(&quants);
+            sflat.extend_from_slice(&scales);
+            layout
+        } else {
+            let offset = flat.len();
+            flat.extend_from_slice(&classifier.to_bf16_bits());
+            Layout::dense(offset, classifier.out_dim(), classifier.in_dim())
         };
 
+        // A zero-length `Vec::as_ptr` is dangling, and Metal hands back nil
+        // for a zero-length buffer — which panics when dropped. Pad every
+        // store so the pointer is always backed, even when a storage has no
+        // projections (a fully quantized model uploads no bf16 at all).
+        if flat.is_empty() {
+            flat.push(0);
+        }
+        if qflat.is_empty() {
+            qflat.push(0);
+        }
+        if sflat.is_empty() {
+            sflat.push(0.0);
+        }
         self.weights = self.device.new_buffer_with_data(
             flat.as_ptr() as *const _,
             (flat.len() * 2) as u64,
             MTLResourceOptions::StorageModeShared,
         );
+        self.qweights = self.device.new_buffer_with_data(
+            qflat.as_ptr() as *const _,
+            qflat.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        self.qscales = self.device.new_buffer_with_data(
+            sflat.as_ptr() as *const _,
+            (sflat.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
         self.layers = layers;
         self.classifier = classifier_layout;
+        self.qkv = qkv;
+        self.gate_up = gate_up;
+    }
+
+    /// Encode `y[rows, out] = x[rows, in] * w[out, in]^T` over row-major
+    /// Q8_0 blocks: int8 weights plus one f32 scale per 32-wide block.
+    fn dispatch_q8(&mut self, layout: Layout, x: Buf, y: Buf, rows: usize) {
+        let a = self.buf(x);
+        let c = self.buf(y);
+        let qw = self.qweights.clone();
+        let qs = self.qscales.clone();
+        let qo = layout.q_offset as u64;
+        let so = (layout.s_offset * 4) as u64;
+        let n = layout.out_dim as u32;
+        let k = layout.in_dim as u32;
+        let m = rows as u32;
+        let nb = (layout.in_dim / crate::ops::Q8_0_BLOCK) as u32;
+        let vector = rows == 1;
+        let gemm = self.gemm_q8_pipeline.clone();
+        let gemv = self.gemv_q8_pipeline.clone();
+
+        self.encode(move |enc| {
+            if vector {
+                enc.set_compute_pipeline_state(&gemv);
+                enc.set_buffer(0, Some(&qw), qo);
+                enc.set_buffer(1, Some(&qs), so);
+                enc.set_buffer(2, Some(&a), 0);
+                enc.set_buffer(3, Some(&c), 0);
+                enc.set_bytes(4, 4, &n as *const u32 as *const _);
+                enc.set_bytes(5, 4, &k as *const u32 as *const _);
+                enc.set_bytes(6, 4, &nb as *const u32 as *const _);
+                enc.dispatch_threads(
+                    MTLSize::new(layout.out_dim as u64, 1, 1),
+                    MTLSize::new(64, 1, 1),
+                );
+            } else {
+                enc.set_compute_pipeline_state(&gemm);
+                enc.set_buffer(0, Some(&a), 0);
+                enc.set_buffer(1, Some(&qw), qo);
+                enc.set_buffer(2, Some(&qs), so);
+                enc.set_buffer(3, Some(&c), 0);
+                enc.set_bytes(4, 4, &m as *const u32 as *const _);
+                enc.set_bytes(5, 4, &n as *const u32 as *const _);
+                enc.set_bytes(6, 4, &k as *const u32 as *const _);
+                enc.set_bytes(7, 4, &nb as *const u32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(
+                        (layout.out_dim as u64).div_ceil(BLOCK_N),
+                        (rows as u64).div_ceil(BLOCK_M),
+                        1,
+                    ),
+                    MTLSize::new(16, 16, 1),
+                );
+            }
+        });
     }
 
     /// Encode `y[rows, out] = x[rows, in] * w[out, in]^T`.
     fn dispatch(&mut self, layout: Layout, x: Buf, y: Buf, rows: usize) {
+        if layout.is_q8() {
+            self.dispatch_q8(layout, x, y, rows);
+            return;
+        }
         let a = self.buf(x);
         let c = self.buf(y);
         let weights = self.weights.clone();
@@ -591,6 +1225,205 @@ impl Metal {
                 enc.dispatch_thread_groups(
                     MTLSize::new(
                         (layout.out_dim as u64).div_ceil(BLOCK_N),
+                        (rows as u64).div_ceil(BLOCK_M),
+                        1,
+                    ),
+                    MTLSize::new(16, 16, 1),
+                );
+            }
+        });
+    }
+
+    /// Test-only Q8 dispatch over explicit weight buffers, without a
+    /// prepared model. The integration tests cover dispatch through `project`;
+    /// these cover the kernels against a host oracle on synthetic shapes.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_q8_dispatch(
+        &mut self,
+        qw: &Buffer,
+        qs: &Buffer,
+        x: Buf,
+        y: Buf,
+        out_dim: usize,
+        in_dim: usize,
+    ) {
+        let a = self.buf(x);
+        let c = self.buf(y);
+        let (qw, qs) = (qw.clone(), qs.clone());
+        let n = out_dim as u32;
+        let k = in_dim as u32;
+        let nb = (in_dim / crate::ops::Q8_0_BLOCK) as u32;
+        let pipeline = self.gemv_q8_pipeline.clone();
+        self.encode(move |enc| {
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(0, Some(&qw), 0);
+            enc.set_buffer(1, Some(&qs), 0);
+            enc.set_buffer(2, Some(&a), 0);
+            enc.set_buffer(3, Some(&c), 0);
+            enc.set_bytes(4, 4, &n as *const u32 as *const _);
+            enc.set_bytes(5, 4, &k as *const u32 as *const _);
+            enc.set_bytes(6, 4, &nb as *const u32 as *const _);
+            enc.dispatch_threads(MTLSize::new(out_dim as u64, 1, 1), MTLSize::new(64, 1, 1));
+        });
+    }
+
+    /// Test-only batched Q8 dispatch; see [`Metal::gemv_q8_dispatch`].
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_q8_dispatch(
+        &mut self,
+        qw: &Buffer,
+        qs: &Buffer,
+        x: Buf,
+        y: Buf,
+        out_dim: usize,
+        in_dim: usize,
+        rows: usize,
+    ) {
+        let a = self.buf(x);
+        let c = self.buf(y);
+        let (qw, qs) = (qw.clone(), qs.clone());
+        let m = rows as u32;
+        let n = out_dim as u32;
+        let k = in_dim as u32;
+        let nb = (in_dim / crate::ops::Q8_0_BLOCK) as u32;
+        let pipeline = self.gemm_q8_pipeline.clone();
+        self.encode(move |enc| {
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(0, Some(&a), 0);
+            enc.set_buffer(1, Some(&qw), 0);
+            enc.set_buffer(2, Some(&qs), 0);
+            enc.set_buffer(3, Some(&c), 0);
+            enc.set_bytes(4, 4, &m as *const u32 as *const _);
+            enc.set_bytes(5, 4, &n as *const u32 as *const _);
+            enc.set_bytes(6, 4, &k as *const u32 as *const _);
+            enc.set_bytes(7, 4, &nb as *const u32 as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(
+                    (out_dim as u64).div_ceil(BLOCK_N),
+                    (rows as u64).div_ceil(BLOCK_M),
+                    1,
+                ),
+                MTLSize::new(16, 16, 1),
+            );
+        });
+    }
+    /// One dispatch for a fused [n0 | n1 | n2] projection triple.
+    ///
+    /// `o2` is written only when `n2 > 0`; the GateUp path passes its own
+    /// `gate` buffer twice so the extra binding is harmless but never stored.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_fused(
+        &mut self,
+        fused: FusedLayout,
+        x: Buf,
+        o0: Buf,
+        o1: Buf,
+        o2: Buf,
+        rows: usize,
+    ) {
+        let a = self.buf(x);
+        let (b0, b1, b2) = (self.buf(o0), self.buf(o1), self.buf(o2));
+        let vector = rows == 1;
+        let (n0, n1, n2, k) = (
+            fused.n0 as u32,
+            fused.n1 as u32,
+            fused.n2 as u32,
+            fused.in_dim as u32,
+        );
+        let m = rows as u32;
+        if fused.is_q8 {
+            let qw = self.qweights.clone();
+            let qs = self.qscales.clone();
+            let qo = fused.w_offset as u64;
+            let so = (fused.s_offset * 4) as u64;
+            let nb = (fused.in_dim / crate::ops::Q8_0_BLOCK) as u32;
+            let (gemm, gemv) = (
+                self.gemm_q8_qkv_pipeline.clone(),
+                self.gemv_q8_qkv_pipeline.clone(),
+            );
+            self.encode(move |enc| {
+                if vector {
+                    enc.set_compute_pipeline_state(&gemv);
+                    enc.set_buffer(0, Some(&qw), qo);
+                    enc.set_buffer(1, Some(&qs), so);
+                    enc.set_buffer(2, Some(&b0), 0);
+                    enc.set_buffer(3, Some(&b1), 0);
+                    enc.set_buffer(4, Some(&b2), 0);
+                    enc.set_buffer(5, Some(&a), 0);
+                    enc.set_bytes(6, 4, &n0 as *const u32 as *const _);
+                    enc.set_bytes(7, 4, &n1 as *const u32 as *const _);
+                    enc.set_bytes(8, 4, &n2 as *const u32 as *const _);
+                    enc.set_bytes(9, 4, &k as *const u32 as *const _);
+                    enc.set_bytes(10, 4, &nb as *const u32 as *const _);
+                    enc.dispatch_threads(
+                        MTLSize::new((n0 + n1 + n2) as u64, 1, 1),
+                        MTLSize::new(64, 1, 1),
+                    );
+                } else {
+                    enc.set_compute_pipeline_state(&gemm);
+                    enc.set_buffer(0, Some(&a), 0);
+                    enc.set_buffer(1, Some(&qw), qo);
+                    enc.set_buffer(2, Some(&qs), so);
+                    enc.set_buffer(3, Some(&b0), 0);
+                    enc.set_buffer(4, Some(&b1), 0);
+                    enc.set_buffer(5, Some(&b2), 0);
+                    enc.set_bytes(6, 4, &m as *const u32 as *const _);
+                    enc.set_bytes(7, 4, &k as *const u32 as *const _);
+                    enc.set_bytes(8, 4, &nb as *const u32 as *const _);
+                    enc.set_bytes(9, 4, &n0 as *const u32 as *const _);
+                    enc.set_bytes(10, 4, &n1 as *const u32 as *const _);
+                    enc.set_bytes(11, 4, &n2 as *const u32 as *const _);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(
+                            ((n0 + n1 + n2) as u64).div_ceil(BLOCK_N),
+                            (rows as u64).div_ceil(BLOCK_M),
+                            1,
+                        ),
+                        MTLSize::new(16, 16, 1),
+                    );
+                }
+            });
+            return;
+        }
+        let weights = self.weights.clone();
+        let wo = fused.w_offset as u64 * 2;
+        let (gemm, gemv) = (
+            self.gemm_qkv_pipeline.clone(),
+            self.gemv_qkv_pipeline.clone(),
+        );
+        self.encode(move |enc| {
+            if vector {
+                enc.set_compute_pipeline_state(&gemv);
+                enc.set_buffer(0, Some(&weights), wo);
+                enc.set_buffer(1, Some(&b0), 0);
+                enc.set_buffer(2, Some(&b1), 0);
+                enc.set_buffer(3, Some(&b2), 0);
+                enc.set_buffer(4, Some(&a), 0);
+                enc.set_bytes(5, 4, &n0 as *const u32 as *const _);
+                enc.set_bytes(6, 4, &n1 as *const u32 as *const _);
+                enc.set_bytes(7, 4, &n2 as *const u32 as *const _);
+                enc.set_bytes(8, 4, &k as *const u32 as *const _);
+                enc.dispatch_threads(
+                    MTLSize::new((n0 + n1 + n2) as u64, 1, 1),
+                    MTLSize::new(64, 1, 1),
+                );
+            } else {
+                enc.set_compute_pipeline_state(&gemm);
+                enc.set_buffer(0, Some(&a), 0);
+                enc.set_buffer(1, Some(&weights), wo);
+                enc.set_buffer(2, Some(&b0), 0);
+                enc.set_buffer(3, Some(&b1), 0);
+                enc.set_buffer(4, Some(&b2), 0);
+                enc.set_bytes(5, 4, &m as *const u32 as *const _);
+                enc.set_bytes(6, 4, &k as *const u32 as *const _);
+                enc.set_bytes(7, 4, &n0 as *const u32 as *const _);
+                enc.set_bytes(8, 4, &n1 as *const u32 as *const _);
+                enc.set_bytes(9, 4, &n2 as *const u32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(
+                        ((n0 + n1 + n2) as u64).div_ceil(BLOCK_N),
                         (rows as u64).div_ceil(BLOCK_M),
                         1,
                     ),
@@ -1043,6 +1876,22 @@ impl Backend for Metal {
         let layout = self.classifier;
         self.dispatch(layout, x, y, 1);
     }
+
+    fn project_qkv(&mut self, layer: usize, x: Buf, q: Buf, k: Buf, v: Buf, rows: usize) {
+        let fused = self.qkv[layer];
+        assert!(
+            fused.n0 > 0,
+            "project_qkv on a layer without attention weights"
+        );
+        self.dispatch_fused(fused, x, q, k, v, rows);
+    }
+
+    fn project_gate_up(&mut self, layer: usize, x: Buf, gate: Buf, up: Buf, rows: usize) {
+        let fused = self.gate_up[layer];
+        assert!(fused.n0 > 0, "project_gate_up on a layer without an MLP");
+        // A GateUp fusion is a QKV fusion whose third slice is empty.
+        self.dispatch_fused(fused, x, gate, up, gate, rows);
+    }
 }
 
 impl std::fmt::Debug for Metal {
@@ -1176,6 +2025,208 @@ mod tests {
         let mut got = vec![0.0; 2];
         m.read(d, &mut got);
         assert_eq!(got, vec![11.0, 22.0], "add");
+
+        // Q8 GEMV and GEMM against a host dot product over the dequantized
+        // rows: the kernels must read the same logical weights the loader
+        // wrote, whatever the host layout was.
+        for &(out_dim, in_dim) in &[(64usize, 64usize), (8, 64), (16, 128)] {
+            let data: Vec<f32> = (0..out_dim * in_dim)
+                .map(|i| ((i * 17 % 251) as f32 - 125.0) / 137.0)
+                .collect();
+            let matrix = crate::ops::Matrix::from_f32_q8_0(
+                crate::tensor::Tensor::from_vec(data, &[out_dim, in_dim]).unwrap(),
+            )
+            .unwrap();
+            let (quants, scales) = matrix.to_q8_row_major().unwrap();
+            let qw = m.device.new_buffer_with_data(
+                quants.as_ptr() as *const _,
+                quants.len().max(1) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let sw = m.device.new_buffer_with_data(
+                scales.as_ptr() as *const _,
+                (scales.len().max(1) * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let x: Vec<f32> = (0..in_dim).map(|i| (i as f32 * 0.37).sin()).collect();
+            let xb = m.upload(&x);
+            // one row: GEMV
+            {
+                let yb = m.alloc(out_dim);
+                m.gemv_q8_dispatch(&qw, &sw, xb, yb, out_dim, in_dim);
+                let mut got = vec![0.0; out_dim];
+                m.read(yb, &mut got);
+                let mut row = vec![0.0f32; in_dim];
+                for (r, g) in got.iter().enumerate() {
+                    matrix.decode_row(r, &mut row);
+                    let want: f32 = row.iter().zip(&x).map(|(a, b)| a * b).sum();
+                    assert!(
+                        (g - want).abs() <= 1e-4 * (1.0 + want.abs()),
+                        "q8 gemv row {r}: {g} vs {want}"
+                    );
+                }
+            }
+            // ones scales: with every scale at 1.0, any scale-indexing
+            // bug disappears and only the int8 load/dot path is exercised.
+            {
+                let (hq, _) = matrix.to_q8_row_major().unwrap();
+                let sw1 = vec![1.0f32; scales.len()];
+                let qwb = m.device.new_buffer_with_data(
+                    hq.as_ptr() as *const _,
+                    hq.len().max(1) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                let swb = m.device.new_buffer_with_data(
+                    sw1.as_ptr() as *const _,
+                    (sw1.len().max(1) * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                let xb1 = m.upload(&x);
+                let yb1 = m.alloc(out_dim);
+                m.gemm_q8_dispatch(&qwb, &swb, xb1, yb1, out_dim, in_dim, 1);
+                let mut got1 = vec![0.0; out_dim];
+                m.read(yb1, &mut got1);
+                // reference without scales: pure int8 dot
+                for (o, g) in got1.iter().enumerate() {
+                    let want: f32 = hq[o * in_dim..(o + 1) * in_dim]
+                        .iter()
+                        .zip(&x)
+                        .map(|(&q, &xv)| q as f32 * xv)
+                        .sum();
+                    assert!(
+                        (g - want).abs() <= 1e-4 * (1.0 + want.abs()),
+                        "ones-scale out {o}: {g} vs {want}"
+                    );
+                }
+            }
+            // one row through the tiled GEMM path (vs GEMV above)
+            {
+                let xb1 = m.upload(&x);
+                let yb1 = m.alloc(out_dim);
+                m.gemm_q8_dispatch(&qw, &sw, xb1, yb1, out_dim, in_dim, 1);
+                let mut got1 = vec![0.0; out_dim];
+                m.read(yb1, &mut got1);
+                let mut row = vec![0.0f32; in_dim];
+                for (o, g) in got1.iter().enumerate() {
+                    matrix.decode_row(o, &mut row);
+                    let want: f32 = row.iter().zip(&x).map(|(a, b)| a * b).sum();
+                    let tol = 1e-4 * (1.0 + want.abs());
+                    assert!(
+                        (g - want).abs() <= tol,
+                        "q8 gemm-1row out {o}: {g} vs {want}"
+                    );
+                }
+            }
+            // full-width rows: every output row of a multi-row batch.
+            {
+                let rows = 8usize;
+                let mut xx = Vec::with_capacity(rows * in_dim);
+                for r in 0..rows {
+                    xx.extend(x.iter().map(|v| v * (r as f32 + 1.0)));
+                }
+                let xb = m.upload(&xx);
+                let yb = m.alloc(rows * out_dim);
+                m.gemm_q8_dispatch(&qw, &sw, xb, yb, out_dim, in_dim, rows);
+                let mut got = vec![0.0; rows * out_dim];
+                m.read(yb, &mut got);
+                let mut row = vec![0.0f32; in_dim];
+                for r in 0..rows {
+                    for (o, g) in got[r * out_dim..(r + 1) * out_dim].iter().enumerate() {
+                        matrix.decode_row(o, &mut row);
+                        let want: f32 = row
+                            .iter()
+                            .zip(&xx[r * in_dim..(r + 1) * in_dim])
+                            .map(|(a, b)| a * b)
+                            .sum();
+                        // Tiled accumulation sums in a different order than the
+                        // reference loop; tolerance is relative to the scale.
+                        let tol = 2e-5 * (1.0 + want.abs());
+                        assert!(
+                            (g - want).abs() <= tol,
+                            "q8 gemm row {r} out {o}: {g} vs {want}"
+                        );
+                    }
+                }
+            }
+            // row-uniform scales: every block in a row shares one scale,
+            // so only the row index matters, not the tile index.
+            {
+                let rows = 4usize;
+                let mut xx = Vec::with_capacity(rows * in_dim);
+                for r in 0..rows {
+                    xx.extend(x.iter().map(|v| v * (r as f32 + 1.0)));
+                }
+                // build scales[row] = 1.0 + 0.5 * row
+                let (hq, _) = matrix.to_q8_row_major().unwrap();
+                let nbb = in_dim / crate::ops::Q8_0_BLOCK;
+                let mut hs = vec![0.0f32; out_dim * nbb];
+                for r in 0..out_dim {
+                    for b in 0..nbb {
+                        hs[r * nbb + b] = 1.0 + 0.5 * (r as f32);
+                    }
+                }
+                let qwb = m.device.new_buffer_with_data(
+                    hq.as_ptr() as *const _,
+                    hq.len().max(1) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                let swb = m.device.new_buffer_with_data(
+                    hs.as_ptr() as *const _,
+                    (hs.len().max(1) * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                let xb = m.upload(&xx);
+                let yb = m.alloc(rows * out_dim);
+                m.gemm_q8_dispatch(&qwb, &swb, xb, yb, out_dim, in_dim, rows);
+                let mut got = vec![0.0; rows * out_dim];
+                m.read(yb, &mut got);
+                for r in 0..rows {
+                    for (o, g) in got[r * out_dim..(r + 1) * out_dim].iter().enumerate() {
+                        // reference with row-uniform scales
+                        let want: f32 = matrix.to_q8_row_major().unwrap().0
+                            [o * in_dim..(o + 1) * in_dim]
+                            .iter()
+                            .zip(&xx[r * in_dim..(r + 1) * in_dim])
+                            .map(|(&q, &xv)| q as f32 * xv)
+                            .sum::<f32>()
+                            * (1.0 + 0.5 * (o as f32));
+                        let tol = 1e-3 * (1.0 + want.abs());
+                        assert!(
+                            (g - want).abs() <= tol,
+                            "q8 gemm rowuni r={r} o={o}: {g} vs {want}"
+                        );
+                    }
+                }
+            }
+            // three rows: tiled GEMM
+            {
+                let rows = 3usize;
+                let mut xx = Vec::with_capacity(rows * in_dim);
+                for r in 0..rows {
+                    xx.extend(x.iter().map(|v| v * (r as f32 + 1.0)));
+                }
+                let xb = m.upload(&xx);
+                let yb = m.alloc(rows * out_dim);
+                m.gemm_q8_dispatch(&qw, &sw, xb, yb, out_dim, in_dim, rows);
+                let mut got = vec![0.0; rows * out_dim];
+                m.read(yb, &mut got);
+                let mut row = vec![0.0f32; in_dim];
+                for r in 0..rows {
+                    for (o, g) in got[r * out_dim..(r + 1) * out_dim].iter().enumerate() {
+                        matrix.decode_row(o, &mut row);
+                        let want: f32 = row
+                            .iter()
+                            .zip(&xx[r * in_dim..(r + 1) * in_dim])
+                            .map(|(a, b)| a * b)
+                            .sum();
+                        assert!(
+                            (g - want).abs() <= 1e-3 * (1.0 + want.abs()),
+                            "q8 gemm row {r} out {o}: {g} vs {want}"
+                        );
+                    }
+                }
+            }
+        }
 
         // mul with offsets, including same-buffer operands
         let ab = m.upload(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);

@@ -682,6 +682,35 @@ mod tests {
         assert!(Matrix::from_f32_q8_0x4(t(vec![0.0; 8 * 32], &[8, 32])).is_some());
     }
 
+    /// The device repack preserves every row: de-interleaving the four-row
+    /// blocks must reproduce `row()` exactly, since the GPU kernels read the
+    /// repacked form while the oracle reads the packed one.
+    #[test]
+    fn q8x4_to_row_major_matches_decode_row() {
+        for &(out_dim, in_dim) in &[(4usize, 32usize), (8, 64), (16, 128)] {
+            let data: Vec<f32> = (0..out_dim * in_dim)
+                .map(|i| ((i * 17 % 251) as f32 - 125.0) / 137.0)
+                .collect();
+            let packed = Matrix::from_f32_q8_0x4(t(data, &[out_dim, in_dim])).unwrap();
+            let (quants, scales) = packed.to_q8_row_major().expect("quantized");
+            let blocks = in_dim / crate::ops::Q8_0_BLOCK;
+            assert_eq!(quants.len(), out_dim * in_dim);
+            assert_eq!(scales.len(), out_dim * blocks);
+            let mut row = vec![0.0f32; in_dim];
+            for r in 0..out_dim {
+                packed.decode_row(r, &mut row);
+                for (i, &v) in row.iter().enumerate() {
+                    let back = f32::from(quants[r * in_dim + i])
+                        * scales[r * blocks + i / crate::ops::Q8_0_BLOCK];
+                    assert!(
+                        (back - v).abs() <= 1e-6,
+                        "row {r} lane {i}: repacked {back} vs decoded {v}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn q8x4_decodes_each_row_to_the_plain_quantization() {
         let (out_dim, in_dim) = (8usize, 64usize);

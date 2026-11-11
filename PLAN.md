@@ -342,15 +342,18 @@ Llama path unchanged.
 
 M1, `VECLIB_MAXIMUM_THREADS=1`; prefill of 128 tokens, `tg1` decode:
 
-| model | prefill CPU bf16 | prefill CPU q8_0x4 | prefill Metal | decode CPU bf16 | decode CPU q8_0x4 | decode Metal |
-|---|---|---|---|---|---|---|
-| 350M | 749 | 303 | 789 | 26.6 | 143.5 | 37.7 |
-| 700M | 28¹ | 146 | 386 | 24.8 | 67.7 | 20.2 |
+| model | prefill CPU bf16 | prefill CPU q8_0x4 | prefill Metal bf16 | prefill Metal q8_0x4 | decode CPU bf16 | decode CPU q8_0x4 | decode Metal bf16 | decode Metal q8_0x4 |
+|---|---|---|---|---|---|---|---|---|
+| 350M | 751 | 303 | 785 | 904 | 26.5 | 132 | 38.0 | 52.6 |
+| 700M | 28¹ | 144 | 387 | 456 | 24.8 | 68.1 | 20.6 | 29.4 |
 
 ¹ 700M bf16 trips the 2 GB widen budget and falls back to the row-at-a-time
 loop; forcing the f32 copy (`KERNRT_PREFILL_F32=1`) reaches 402 tok/s. Metal
-stores bf16 regardless of requested storage, so its two columns match by
-construction — and it wins bf16 decode outright at 350M (37.7 vs 26.6).
+reads its own weight copy — bf16, or native Q8 (int8 + f32 scales, f32
+activations) — and fuses QKV plus GateUp into one dispatch each. It wins
+bf16 decode outright at 350M (38.0 vs 26.5) and prefill everywhere, but
+still loses Q8 decode to the CPU's SDOT path (52.6 vs 132): the per-token
+launch count, not the bytes, is the wall there.
 
 Correctness is gated the usual way: a synthetic two-layer conv+attention model
 that cpu, reference and Metal (where present) must reproduce on decode and
